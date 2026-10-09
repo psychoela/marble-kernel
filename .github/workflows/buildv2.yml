@@ -182,21 +182,6 @@ jobs:
           cp ../config.txt out/.config
           printf 'CONFIG_NOMOUNT=y\nCONFIG_KSU=y\n' >> out/.config
 
-          # KernelSU-Next hook mode: tracepoint -> hybrid.
-          # Option names differ between KernelSU-Next versions, so read them from its Kconfig.
-          KSU_KCONFIG=/w/kernel/KernelSU-Next/kernel/Kconfig
-          echo "--- hook related options in KernelSU-Next Kconfig:"
-          grep -nE '^[[:space:]]*config[[:space:]]+KSU_.*(HOOK|HYBRID|TRACEPOINT)' "$KSU_KCONFIG" || true
-          ksu_sym() { sed -nE "s/^[[:space:]]*config[[:space:]]+(KSU_[A-Z0-9_]*$1[A-Z0-9_]*).*/\1/p" "$KSU_KCONFIG" | head -1; }
-          HYBRID_SYM="$(ksu_sym HYBRID)"
-          TRACEPOINT_SYM="$(ksu_sym TRACEPOINT)"
-          [ -n "$HYBRID_SYM" ] || { echo "ERROR: no hybrid hook option in this KernelSU-Next version, see the list above"; exit 1; }
-          if [ -n "$TRACEPOINT_SYM" ]; then
-            sed -i "/^CONFIG_${TRACEPOINT_SYM}=/d" out/.config
-            echo "# CONFIG_${TRACEPOINT_SYM} is not set" >> out/.config
-          fi
-          echo "CONFIG_${HYBRID_SYM}=y" >> out/.config
-
           # Optional: seccomp off (see DISABLE_SECCOMP in the workflow env)
           if [ "${DISABLE_SECCOMP:-0}" = 1 ]; then
             sed -i 's/^CONFIG_SECCOMP=y/# CONFIG_SECCOMP is not set/; s/^CONFIG_SECCOMP_FILTER=y/# CONFIG_SECCOMP_FILTER is not set/' out/.config
@@ -211,8 +196,7 @@ jobs:
           grep -q '^CONFIG_KSU=y' out/.config
           grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config
           grep -q '^CONFIG_CFI_CLANG=y' out/.config
-          grep -E "^CONFIG_(${HYBRID_SYM}|SECCOMP|SECCOMP_FILTER)=" out/.config || true
-          grep -q "^CONFIG_${HYBRID_SYM}=y" out/.config
+          grep -E '^CONFIG_(SECCOMP|SECCOMP_FILTER)=' out/.config || true
           if [ "${DISABLE_SECCOMP:-0}" = 1 ] && grep -q '^CONFIG_SECCOMP=y' out/.config; then echo "ERROR: CONFIG_SECCOMP is still on"; exit 1; fi
           diff <(grep -E '^(CONFIG_|# CONFIG_)' ../config.txt | sort) <(grep -E '^(CONFIG_|# CONFIG_)' out/.config | sort) > ../config.diff || true
           echo "--- config differences against the phone config:"
