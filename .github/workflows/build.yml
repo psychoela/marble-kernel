@@ -13,6 +13,8 @@ env:
   KSUN_REPO: https://github.com/pershoot/KernelSU-Next
   KSUN_BRANCH: dev-susfs
   KSUN_SHA: ""
+  # Official stable release to compare against (only used for a check printed in the log).
+  KSUN_STABLE_TAG: v3.4.1
   # SUSFS kernel patches (simonpunk). SUSFS_SHA empty = branch tip, printed in the log.
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
   SUSFS_BRANCH: gki-android12-5.10
@@ -190,6 +192,21 @@ jobs:
 
           grep -n nomount "$K/fs/Makefile" "$K/fs/Kconfig"
           grep -n kernelsu "$K/drivers/Makefile" "$K/drivers/Kconfig"
+
+      - name: Check whether this KernelSU-Next already contains the official stable release
+        continue-on-error: true
+        run: |
+          set -eu
+          cd kernel/KernelSU-Next
+          git fetch -q https://github.com/KernelSU-Next/KernelSU-Next tag "$KSUN_STABLE_TAG"
+          TAGSHA="$(git rev-parse FETCH_HEAD^{commit})"
+          echo "official $KSUN_STABLE_TAG = $TAGSHA"
+          echo "kernel KSU-Next commit (dev-susfs) = $(git rev-parse HEAD)"
+          if git merge-base --is-ancestor "$TAGSHA" HEAD; then
+            echo "OK: this kernel includes the official $KSUN_STABLE_TAG release."
+          else
+            echo "NOTE: this kernel does NOT include official $KSUN_STABLE_TAG yet (pershoot has not synced it)."
+          fi
 
       - name: Write in-container build script
         run: |
