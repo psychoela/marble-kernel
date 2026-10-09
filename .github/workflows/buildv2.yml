@@ -19,6 +19,11 @@ env:
   # Currently "0": SUSFS's 10_enable_susfs_for_ksu.patch does not apply to the backslashxx fork
   # (the kernel/Kconfig hunk is rejected, other files not checked yet).
   ENABLE_SUSFS: "0"
+  # This KernelSU fork is built around manual hooks in the kernel source, which this kernel does not have
+  # (symptom: manager says "Working" but "Failed to grant Root!"). On arm64 its syscall-table mode
+  # replaces the execve / faccessat / stat / reboot / avc hooks. "1" = turn it on (build stops early
+  # if the driver has no such option), "0" = leave it off.
+  KSU_TAMPER_SYSCALL_TABLE: "1"
   # SUSFS kernel patches (simonpunk). SUSFS_SHA empty = branch tip, printed in the log.
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
   SUSFS_BRANCH: gki-android12-5.10
@@ -240,6 +245,12 @@ jobs:
           if [ "${ENABLE_SUSFS:-0}" = 1 ]; then echo 'CONFIG_KSU_SUSFS=y' >> out/.config; fi
           echo "--- hook related options in the KernelSU Kconfig:"
           grep -rnE 'config KSU_[A-Z0-9_]*(HOOK|KPROBES|TRACEPOINT|TAMPER)' /w/kernel/KernelSU/kernel --include='Kconfig*' || true
+          if [ "${KSU_TAMPER_SYSCALL_TABLE:-0}" = 1 ]; then
+            grep -rq 'config KSU_TAMPER_SYSCALL_TABLE' /w/kernel/KernelSU/kernel --include='Kconfig*' \
+              || { echo "ERROR: this KernelSU has no KSU_TAMPER_SYSCALL_TABLE option, see the list above"; exit 1; }
+            grep -rn -A15 'config KSU_TAMPER_SYSCALL_TABLE' /w/kernel/KernelSU/kernel --include='Kconfig*' || true
+            echo 'CONFIG_KSU_TAMPER_SYSCALL_TABLE=y' >> out/.config
+          fi
 
           # Optional: seccomp off (see DISABLE_SECCOMP in the workflow env)
           if [ "${DISABLE_SECCOMP:-0}" = 1 ]; then
@@ -254,6 +265,10 @@ jobs:
           grep -q '^CONFIG_NOMOUNT=y' out/.config
           grep -q '^CONFIG_KSU=y' out/.config
           if [ "${ENABLE_SUSFS:-0}" = 1 ]; then grep -q '^CONFIG_KSU_SUSFS=y' out/.config; fi
+          if [ "${KSU_TAMPER_SYSCALL_TABLE:-0}" = 1 ]; then
+            grep -q '^CONFIG_KSU_TAMPER_SYSCALL_TABLE=y' out/.config \
+              || { echo "ERROR: KSU_TAMPER_SYSCALL_TABLE was dropped by olddefconfig (missing dependency?), see the Kconfig entry printed above"; exit 1; }
+          fi
           grep -E '^CONFIG_KSU' out/.config
           grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config
           grep -q '^CONFIG_CFI_CLANG=y' out/.config
@@ -292,6 +307,7 @@ jobs:
             -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
             -e DISABLE_SECCOMP="$DISABLE_SECCOMP" \
             -e ENABLE_SUSFS="$ENABLE_SUSFS" \
+            -e KSU_TAMPER_SYSCALL_TABLE="$KSU_TAMPER_SYSCALL_TABLE" \
             -v "$PWD":/w \
             -v "$HOME/clang":/clang:ro \
             "$BUILD_IMAGE" bash /w/ci-build.sh
