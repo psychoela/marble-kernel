@@ -335,25 +335,38 @@ jobs:
           unzip -p susfs4ksu-module.zip module.prop
           sha256sum susfs4ksu-module.zip | tee -a SHA256SUMS
 
-      - name: Fetch KernelSU-Next manager APK (CI build of the same commit)
+      - name: Fetch KernelSU-Next manager APK (official CI build matching the kernel)
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          SHA="$(git -C kernel/KernelSU-Next rev-parse HEAD)"
-          API="https://api.github.com/repos/pershoot/KernelSU-Next"
+          # pershoot's fork has no manager CI. The manager is built by the official repo's
+          # CI (build-manager-ci.yml on dev), so find the official dev commit that the
+          # dev-susfs branch is based on and use the manager built from it.
+          OFFICIAL="KernelSU-Next/KernelSU-Next"
+          API="https://api.github.com/repos/$OFFICIAL"
           gh_get() { curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
-          echo "kernel KSU-Next commit: $SHA"
-          gh_get "$API/actions/workflows/build-manager-ci.yml/runs?head_sha=$SHA&status=success&per_page=1" -o runs.json
-          RUN="$(jq -r '.workflow_runs[0].id // empty' runs.json)"
-          if [ -z "$RUN" ]; then
-            echo "WARNING: no successful manager CI run for $SHA. Using the latest successful run on $KSUN_BRANCH (version may differ from the kernel)."
-            gh_get "$API/actions/workflows/build-manager-ci.yml/runs?branch=$KSUN_BRANCH&status=success&per_page=1" -o runs.json
+          cd kernel/KernelSU-Next
+          SHA="$(git rev-parse HEAD)"
+          echo "kernel KSU-Next commit (dev-susfs): $SHA"
+          git fetch -q "https://github.com/$OFFICIAL" dev
+          BASE="$(git merge-base HEAD FETCH_HEAD)"
+          echo "official dev base commit of this kernel: $BASE"
+          cd ../..
+          RUN=""; USED=""
+          n=0
+          for c in $(git -C kernel/KernelSU-Next rev-list -n 20 "$BASE"); do
+            gh_get "$API/actions/workflows/build-manager-ci.yml/runs?head_sha=$c&status=success&per_page=1" -o runs.json
             RUN="$(jq -r '.workflow_runs[0].id // empty' runs.json)"
+            if [ -n "$RUN" ]; then USED="$c"; break; fi
+            n=$((n+1))
+          done
+          [ -n "$RUN" ] || { echo "No successful official manager CI run found near $BASE"; exit 1; }
+          if [ "$n" -gt 0 ]; then
+            echo "WARNING: no manager CI run for $BASE; using the one $n commit(s) earlier ($USED). Version may differ slightly from the kernel."
           fi
-          [ -n "$RUN" ] || { echo "No manager CI run found"; exit 1; }
-          echo "manager run: $RUN (commit $(jq -r '.workflow_runs[0].head_sha' runs.json))"
+          echo "manager run: $RUN (official commit $USED)"
           gh_get "$API/actions/runs/$RUN/artifacts?per_page=100" -o arts.json
           AID="$(jq -r '[.artifacts[] | select(.name=="manager")][0].id // empty' arts.json)"
           [ -n "$AID" ] || { echo "No 'manager' artifact in run $RUN"; exit 1; }
@@ -371,7 +384,7 @@ jobs:
           print(f"{a.version_name}_{a.version_code}")
           PYEOF
           )" || info=""
-            [ -n "$info" ] || info="unknown-${SHA:0:7}"
+            [ -n "$info" ] || info="unknown-${USED:0:7}"
             mv "$f" "manager/KernelSU-Next-Manager_v${info}.apk"
             echo "manager apk: KernelSU-Next-Manager_v${info}.apk"
           done
