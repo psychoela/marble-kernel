@@ -1,4 +1,4 @@
-name: Build marble kernel (NoMount + KernelSU-Next, Android clang 21 (r563880c), Debian container)
+name: Build marble kernel (NoMount + KernelSU-Next + SUSFS, Android clang 21 (r563880c), Debian container)
 
 on:
   workflow_dispatch:
@@ -8,13 +8,27 @@ env:
   KERNEL_SHA: c3d1c3d93062911060e8460fdb88cab235f6603e
   NOMOUNT_REPO: https://github.com/maxsteeel/nomount
   NOMOUNT_SHA: 7e7342cd48841cfedd00be2fd20a0311f69c48c5
-  KSUN_REPO: https://github.com/KernelSU-Next/KernelSU-Next
-  KSUN_SHA: 763a08d21a4d938c1b22603529c404b269d01fba
+  # KernelSU-Next with SUSFS built in (pershoot's dev-susfs branch).
+  # KSUN_SHA empty = branch tip. The commit used is printed in the log: paste it here to pin it.
+  KSUN_REPO: https://github.com/pershoot/KernelSU-Next
+  KSUN_BRANCH: dev-susfs
+  KSUN_SHA: ""
+  # SUSFS kernel patches (simonpunk). SUSFS_SHA empty = branch tip, printed in the log.
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
+  SUSFS_BRANCH: gki-android12-5.10
+  SUSFS_SHA: ""
+  # Userspace KernelSU module for SUSFS (its latest release is downloaded and shipped as a zip)
+  SUSFS_MODULE_REPO: sidex15/susfs4ksu-module
   # Android clang to use. Change these two lines to try another toolchain.
   CLANG_DIR: clang-r563880c
   CLANG_MAJOR: "21"
   EXPECTED_RELEASE: 5.10.269-gki-gc3d1c3d93062
   BUILD_IMAGE: debian:bookworm-slim
+  # Turn off seccomp in the whole kernel (CONFIG_SECCOMP + CONFIG_SECCOMP_FILTER).
+  # WARNING: this very likely breaks boot. It changes struct task_struct, so the
+  # vendor modules fail the modversions check, and Android's zygote expects seccomp.
+  # Keep "0" unless you accept the risk of a bootloop (set to "1" to try it).
+  DISABLE_SECCOMP: "0"
 
 jobs:
   build:
@@ -121,11 +135,36 @@ jobs:
           }
           fetch_sha "$KERNEL_REPO" "$KERNEL_SHA" kernel
           fetch_sha "$NOMOUNT_REPO" "$NOMOUNT_SHA" nomount
-          # KernelSU-Next: full history, its version number is computed from commit count
-          git clone -q "$KSUN_REPO" ksun
-          git -C ksun checkout -q "$KSUN_SHA"
+          # KernelSU-Next (SUSFS branch): full history, its version number is computed from commit count
+          git clone -q --branch "$KSUN_BRANCH" "$KSUN_REPO" ksun
+          if [ -n "$KSUN_SHA" ]; then git -C ksun checkout -q "$KSUN_SHA"; fi
+          git -C ksun log -1 --format='KernelSU-Next %H %s'
+          grep -rq 'config KSU_SUSFS' ksun/kernel || { echo "ERROR: this KernelSU-Next branch has no SUSFS support"; exit 1; }
+          # SUSFS kernel patches
+          git clone -q --branch "$SUSFS_BRANCH" "$SUSFS_REPO" susfs
+          if [ -n "$SUSFS_SHA" ]; then git -C susfs checkout -q "$SUSFS_SHA"; fi
+          git -C susfs log -1 --format='susfs %H %s'
+          ls susfs/kernel_patches
           git -C kernel log -1 --format='kernel %H %s'
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+
+      - name: Apply SUSFS kernel patches
+        run: |
+          set -eux
+          K="$PWD/kernel"
+          P="$(ls susfs/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -1)"
+          [ -n "$P" ] || { echo "ERROR: no 50_add_susfs_in_*.patch in the SUSFS branch"; exit 1; }
+          P="$PWD/$P"
+          echo "using $P"
+          if [ -d susfs/kernel_patches/fs ]; then cp -f susfs/kernel_patches/fs/* "$K/fs/"; fi
+          if [ -d susfs/kernel_patches/include/linux ]; then cp -f susfs/kernel_patches/include/linux/* "$K/include/linux/"; fi
+          cd "$K"
+          if ! patch -p1 -N --no-backup-if-mismatch < "$P"; then
+            echo "SUSFS patch did not apply cleanly. Rejected hunks:"
+            find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
+            exit 1
+          fi
+          grep -rn 'define SUSFS_VERSION' include/linux/ | head -3
 
       - name: Integrate NoMount and KernelSU-Next
         run: |
@@ -175,22 +214,32 @@ jobs:
 
           mkdir -p out
           cp ../config.txt out/.config
-          printf 'CONFIG_NOMOUNT=y\nCONFIG_KSU=y\n' >> out/.config
+          printf 'CONFIG_NOMOUNT=y\nCONFIG_KSU=y\nCONFIG_KSU_SUSFS=y\n' >> out/.config
+          grep -rnE 'config KSU_[A-Z0-9_]*HOOK' /w/kernel/KernelSU-Next/kernel --include='Kconfig*' || true
+
+          # Optional: seccomp off (see DISABLE_SECCOMP in the workflow env)
+          if [ "${DISABLE_SECCOMP:-0}" = 1 ]; then
+            sed -i 's/^CONFIG_SECCOMP=y/# CONFIG_SECCOMP is not set/; s/^CONFIG_SECCOMP_FILTER=y/# CONFIG_SECCOMP_FILTER is not set/' out/.config
+          fi
           # newer clang adds new warnings; do not let CONFIG_WERROR turn them into errors
           sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
           sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-gki-gc3d1c3d93062"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
           make $MK olddefconfig
-          grep -E '^CONFIG_(NOMOUNT|KSU|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES|LOCALVERSION)=' out/.config
+          grep -E '^CONFIG_(NOMOUNT|KSU|KSU_SUSFS|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES|LOCALVERSION)=' out/.config
           # These must survive olddefconfig, otherwise vendor modules will not load
           grep -q '^CONFIG_NOMOUNT=y' out/.config
           grep -q '^CONFIG_KSU=y' out/.config
+          grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+          grep -E '^CONFIG_KSU' out/.config
           grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config
           grep -q '^CONFIG_CFI_CLANG=y' out/.config
+          grep -E '^CONFIG_(SECCOMP|SECCOMP_FILTER)=' out/.config || true
+          if [ "${DISABLE_SECCOMP:-0}" = 1 ] && grep -q '^CONFIG_SECCOMP=y' out/.config; then echo "ERROR: CONFIG_SECCOMP is still on"; exit 1; fi
           diff <(grep -E '^(CONFIG_|# CONFIG_)' ../config.txt | sort) <(grep -E '^(CONFIG_|# CONFIG_)' out/.config | sort) > ../config.diff || true
           echo "--- config differences against the phone config:"
           cat ../config.diff
 
-          if ! make -j"$(nproc)" $MK KBUILD_BUILD_USER=build KBUILD_BUILD_HOST=github Image > ../build.log 2>&1; then
+          if ! make -j"$(nproc)" $MK KBUILD_BUILD_USER=PsychoAvy KBUILD_BUILD_HOST=github Image > ../build.log 2>&1; then
             echo "BUILD FAILED, errors:"
             grep -nE 'error|Error' ../build.log | head -60 || true
             echo "last 60 lines:"; tail -60 ../build.log
@@ -206,7 +255,8 @@ jobs:
           strings arch/arm64/boot/Image | grep -qx "$EXPECTED_RELEASE SMP preempt mod_unload modversions aarch64"
           echo "nomount symbols: $(grep -cE ' [tT] nm_' System.map)"
           echo "ksu symbols: $(grep -ciE 'ksu' System.map)"
-          grep -E 'KernelSU-Next (version|tag)' ../../build.log || true
+          echo "susfs symbols: $(grep -ciE 'susfs' System.map)"
+          grep -E 'KernelSU-Next (version|tag)|Hook mode' ../../build.log || true
           ls -la arch/arm64/boot/Image
           EOF
           chmod +x ci-build.sh
@@ -216,6 +266,7 @@ jobs:
           set -eux
           docker run --rm \
             -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
+            -e DISABLE_SECCOMP="$DISABLE_SECCOMP" \
             -v "$PWD":/w \
             -v "$HOME/clang":/clang:ro \
             "$BUILD_IMAGE" bash /w/ci-build.sh
@@ -229,9 +280,9 @@ jobs:
           rm -rf .git .github README.md patch ramdisk
           mkdir -p ramdisk patch
           cat > anykernel.sh <<'EOF'
-          ### AnyKernel3 - POCO F5 (marble) GKI 5.10 kernel + NoMount + KernelSU-Next
+          ### AnyKernel3 - POCO F5 (marble) GKI 5.10 kernel + NoMount + KernelSU-Next + SUSFS
           properties() { '
-          kernel.string=marble 5.10.269 GKI | NoMount + KernelSU-Next | Android clang built
+          kernel.string=marble 5.10.269 GKI | NoMount + KernelSU-Next + SUSFS | Android clang built
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -264,6 +315,26 @@ jobs:
           cp kernel/out/arch/arm64/boot/Image Image
           sha256sum marble-nomount-ksun.zip Image | tee SHA256SUMS
 
+      - name: Fetch SUSFS userspace module (latest release)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$SUSFS_MODULE_REPO/releases?per_page=1" -o rel.json
+          jq -r '.[0] | "release: \(.tag_name) \(.name)"' rel.json
+          url="$(jq -r '[.[0].assets[]? | select(.name | endswith(".zip"))][0].browser_download_url // empty' rel.json)"
+          if [ -n "$url" ]; then
+            curl -fsSL -o susfs4ksu-module.zip "$url"
+          else
+            echo "No zip asset in the latest release, zipping the repo source instead"
+            git clone -q --depth 1 "https://github.com/$SUSFS_MODULE_REPO" susfs-module-src
+            (cd susfs-module-src && rm -rf .git .github && zip -qr9 ../susfs4ksu-module.zip .)
+          fi
+          unzip -p susfs4ksu-module.zip module.prop
+          sha256sum susfs4ksu-module.zip | tee -a SHA256SUMS
+
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
@@ -272,6 +343,7 @@ jobs:
           if-no-files-found: warn
           path: |
             marble-nomount-ksun.zip
+            susfs4ksu-module.zip
             Image
             SHA256SUMS
             build.log
