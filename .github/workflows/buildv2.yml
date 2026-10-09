@@ -16,8 +16,9 @@ env:
   KSU_BRANCH: master
   KSU_SHA: "v3.3.0-68"
   # SUSFS on/off. "1" = patch the kernel + patch the KernelSU driver + ship the userspace module.
-  # If the SUSFS patch for KernelSU does not apply to this fork, set this to "0" to build without SUSFS.
-  ENABLE_SUSFS: "1"
+  # Currently "0": SUSFS's 10_enable_susfs_for_ksu.patch does not apply to the backslashxx fork
+  # (the kernel/Kconfig hunk is rejected, other files not checked yet).
+  ENABLE_SUSFS: "0"
   # SUSFS kernel patches (simonpunk). SUSFS_SHA empty = branch tip, printed in the log.
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
   SUSFS_BRANCH: gki-android12-5.10
@@ -165,7 +166,8 @@ jobs:
             [ -f "$KP" ] || { echo "ERROR: $KP not found in the SUSFS branch"; exit 1; }
             if ! (cd ksu && patch -p1 -N --no-backup-if-mismatch < "$KP"); then
               echo "SUSFS patch for KernelSU did not apply cleanly. Rejected hunks:"
-              find ksu -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
+              echo "Files with rejected hunks:"; find ksu -name '*.rej'
+              find ksu -name '*.rej' -exec sh -c 'echo "=== $1"; head -n 40 "$1"' _ {} \;
               echo "Set ENABLE_SUSFS to 0 to build without SUSFS."
               exit 1
             fi
@@ -180,7 +182,8 @@ jobs:
           cd "$K"
           if ! patch -p1 -N --no-backup-if-mismatch < "$P"; then
             echo "SUSFS patch did not apply cleanly. Rejected hunks:"
-            find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
+            echo "Files with rejected hunks:"; find . -name '*.rej'
+            find . -name '*.rej' -exec sh -c 'echo "=== $1"; head -n 40 "$1"' _ {} \;
             exit 1
           fi
           grep -rn 'define SUSFS_VERSION' include/linux/ | head -3
