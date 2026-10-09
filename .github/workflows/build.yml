@@ -335,6 +335,49 @@ jobs:
           unzip -p susfs4ksu-module.zip module.prop
           sha256sum susfs4ksu-module.zip | tee -a SHA256SUMS
 
+      - name: Fetch KernelSU-Next manager APK (CI build of the same commit)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          SHA="$(git -C kernel/KernelSU-Next rev-parse HEAD)"
+          API="https://api.github.com/repos/pershoot/KernelSU-Next"
+          gh_get() { curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+          echo "kernel KSU-Next commit: $SHA"
+          gh_get "$API/actions/workflows/build-manager-ci.yml/runs?head_sha=$SHA&status=success&per_page=1" -o runs.json
+          RUN="$(jq -r '.workflow_runs[0].id // empty' runs.json)"
+          if [ -z "$RUN" ]; then
+            echo "WARNING: no successful manager CI run for $SHA. Using the latest successful run on $KSUN_BRANCH (version may differ from the kernel)."
+            gh_get "$API/actions/workflows/build-manager-ci.yml/runs?branch=$KSUN_BRANCH&status=success&per_page=1" -o runs.json
+            RUN="$(jq -r '.workflow_runs[0].id // empty' runs.json)"
+          fi
+          [ -n "$RUN" ] || { echo "No manager CI run found"; exit 1; }
+          echo "manager run: $RUN (commit $(jq -r '.workflow_runs[0].head_sha' runs.json))"
+          gh_get "$API/actions/runs/$RUN/artifacts?per_page=100" -o arts.json
+          AID="$(jq -r '[.artifacts[] | select(.name=="manager")][0].id // empty' arts.json)"
+          [ -n "$AID" ] || { echo "No 'manager' artifact in run $RUN"; exit 1; }
+          mkdir -p manager
+          gh_get -L "$API/actions/artifacts/$AID/zip" -o manager.zip
+          unzip -q -o manager.zip -d manager
+          # Put the version in the file name (read versionName/versionCode from the APK itself)
+          python3 -m venv /tmp/axml
+          /tmp/axml/bin/pip install -q pyaxmlparser
+          find manager -type f -name '*.apk' | while read -r f; do
+            info="$(/tmp/axml/bin/python - "$f" <<'PYEOF'
+          import sys
+          from pyaxmlparser import APK
+          a = APK(sys.argv[1])
+          print(f"{a.version_name}_{a.version_code}")
+          PYEOF
+          )" || info=""
+            [ -n "$info" ] || info="unknown-${SHA:0:7}"
+            mv "$f" "manager/KernelSU-Next-Manager_v${info}.apk"
+            echo "manager apk: KernelSU-Next-Manager_v${info}.apk"
+          done
+          ls -la manager
+          sha256sum manager/* | tee -a SHA256SUMS
+
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
@@ -344,9 +387,11 @@ jobs:
           path: |
             marble-nomount-ksun.zip
             susfs4ksu-module.zip
+            manager/
             Image
             SHA256SUMS
             build.log
             config.diff
+
 
             
