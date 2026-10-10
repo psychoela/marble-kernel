@@ -1,4 +1,4 @@
-name: Build marble kernel (NoMount + KernelSU-Next + SUSFS, Android clang 21 (r563880c), Debian container)
+name: Build marble kernel (NoMount + KernelSU-Next + SUSFS LKM, Android clang 21 (r563880c), Debian container)
 
 on:
   workflow_dispatch:
@@ -8,17 +8,21 @@ env:
   KERNEL_SHA: c3d1c3d93062911060e8460fdb88cab235f6603e
   NOMOUNT_REPO: https://github.com/maxsteeel/nomount
   NOMOUNT_SHA: 7e7342cd48841cfedd00be2fd20a0311f69c48c5
-  # KernelSU-Next with SUSFS built in (pershoot's dev-susfs branch).
+  # KernelSU-Next (pershoot's dev-susfs branch). Its in-kernel SUSFS stays OFF; SUSFS comes from the LKM below.
   # KSUN_SHA empty = branch tip. The commit used is printed in the log: paste it here to pin it.
   KSUN_REPO: https://github.com/pershoot/KernelSU-Next
   KSUN_BRANCH: dev-susfs
   KSUN_SHA: ""
   # Official stable release to compare against (only used for a check printed in the log).
   KSUN_STABLE_TAG: v3.4.1
-  # SUSFS kernel patches (simonpunk). SUSFS_SHA empty = branch tip, printed in the log.
-  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
-  SUSFS_BRANCH: gki-android12-5.10
-  SUSFS_SHA: ""
+  # SUSFS as a loadable kernel module (susfs4ksu-lkm). The kernel is NOT patched for SUSFS;
+  # the module is built here against this exact kernel (vermagic/modversions must match) and
+  # loaded at runtime with: ksud insmod /data/adb/loader/susfs_guard_lkm.ko
+  # SUSFS_LKM_SHA empty = branch tip, printed in the log. Set BUILD_SUSFS_LKM to "0" to skip the module build.
+  SUSFS_LKM_REPO: https://github.com/inforcqb/susfs4ksu-lkm
+  SUSFS_LKM_BRANCH: main
+  SUSFS_LKM_SHA: ""
+  BUILD_SUSFS_LKM: "1"
   # Android clang to use. Change these two lines to try another toolchain.
   CLANG_DIR: clang-r563880c
   CLANG_MAJOR: "21"
@@ -139,32 +143,13 @@ jobs:
           git clone -q --branch "$KSUN_BRANCH" "$KSUN_REPO" ksun
           if [ -n "$KSUN_SHA" ]; then git -C ksun checkout -q "$KSUN_SHA"; fi
           git -C ksun log -1 --format='KernelSU-Next %H %s'
-          grep -rq 'config KSU_SUSFS' ksun/kernel || { echo "ERROR: this KernelSU-Next branch has no SUSFS support"; exit 1; }
-          # SUSFS kernel patches
-          git clone -q --branch "$SUSFS_BRANCH" "$SUSFS_REPO" susfs
-          if [ -n "$SUSFS_SHA" ]; then git -C susfs checkout -q "$SUSFS_SHA"; fi
-          git -C susfs log -1 --format='susfs %H %s'
-          ls susfs/kernel_patches
+          # SUSFS LKM sources (built later against the freshly built kernel)
+          git clone -q --branch "$SUSFS_LKM_BRANCH" "$SUSFS_LKM_REPO" susfs-lkm
+          if [ -n "$SUSFS_LKM_SHA" ]; then git -C susfs-lkm checkout -q "$SUSFS_LKM_SHA"; fi
+          git -C susfs-lkm log -1 --format='susfs-lkm %H %s'
+          ls susfs-lkm susfs-lkm/kernel
           git -C kernel log -1 --format='kernel %H %s'
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
-
-      - name: Apply SUSFS kernel patches
-        run: |
-          set -eux
-          K="$PWD/kernel"
-          P="$(ls susfs/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -1)"
-          [ -n "$P" ] || { echo "ERROR: no 50_add_susfs_in_*.patch in the SUSFS branch"; exit 1; }
-          P="$PWD/$P"
-          echo "using $P"
-          if [ -d susfs/kernel_patches/fs ]; then cp -f susfs/kernel_patches/fs/* "$K/fs/"; fi
-          if [ -d susfs/kernel_patches/include/linux ]; then cp -f susfs/kernel_patches/include/linux/* "$K/include/linux/"; fi
-          cd "$K"
-          if ! patch -p1 -N --no-backup-if-mismatch < "$P"; then
-            echo "SUSFS patch did not apply cleanly. Rejected hunks:"
-            find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
-            exit 1
-          fi
-          grep -rn 'define SUSFS_VERSION' include/linux/ | head -3
 
       - name: Integrate NoMount and KernelSU-Next
         run: |
@@ -229,7 +214,9 @@ jobs:
 
           mkdir -p out
           cp ../config.txt out/.config
-          printf 'CONFIG_NOMOUNT=y\nCONFIG_KSU=y\nCONFIG_KSU_SUSFS=y\n' >> out/.config
+          printf 'CONFIG_NOMOUNT=y\nCONFIG_KSU=y\n# CONFIG_KSU_SUSFS is not set\n' >> out/.config
+          # Needed so the SUSFS LKM can load and resolve kernel symbols at runtime
+          printf 'CONFIG_MODULES=y\nCONFIG_MODULE_UNLOAD=y\nCONFIG_KALLSYMS=y\nCONFIG_KPROBES=y\n' >> out/.config
           # TCP BBR + Westwood (+ fq qdisc, which BBR works best with). Selectable at runtime; the default stays cubic.
           printf 'CONFIG_TCP_CONG_ADVANCED=y\nCONFIG_TCP_CONG_BBR=y\nCONFIG_TCP_CONG_WESTWOOD=y\nCONFIG_NET_SCH_FQ=y\n' >> out/.config
           # fq_codel + cake qdiscs, TTL/HL iptables target (hotspot TTL), WireGuard VPN
@@ -244,11 +231,16 @@ jobs:
           sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
           sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-gki-gc3d1c3d93062"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
           make $MK olddefconfig
-          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|NOMOUNT|KSU|KSU_SUSFS|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES|LOCALVERSION)=' out/.config
+          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|NOMOUNT|KSU|MODULES|MODULE_UNLOAD|KALLSYMS|KPROBES|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES|LOCALVERSION)=' out/.config
           # These must survive olddefconfig, otherwise vendor modules will not load
           grep -q '^CONFIG_NOMOUNT=y' out/.config
           grep -q '^CONFIG_KSU=y' out/.config
-          grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+          grep -q '^CONFIG_MODULES=y' out/.config
+          grep -q '^CONFIG_MODULE_UNLOAD=y' out/.config
+          grep -q '^CONFIG_KALLSYMS=y' out/.config
+          grep -q '^CONFIG_KPROBES=y' out/.config
+          # SUSFS comes from the LKM, so the in-kernel SUSFS must stay off
+          if grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then echo "ERROR: CONFIG_KSU_SUSFS is on, but the kernel is not SUSFS-patched"; exit 1; fi
           grep -q '^CONFIG_TCP_CONG_BBR=y' out/.config
           grep -q '^CONFIG_TCP_CONG_WESTWOOD=y' out/.config
           grep -q '^CONFIG_NET_SCH_FQ=y' out/.config
@@ -281,9 +273,31 @@ jobs:
           strings arch/arm64/boot/Image | grep -qx "$EXPECTED_RELEASE SMP preempt mod_unload modversions aarch64"
           echo "nomount symbols: $(grep -cE ' [tT] nm_' System.map)"
           echo "ksu symbols: $(grep -ciE 'ksu' System.map)"
-          echo "susfs symbols: $(grep -ciE 'susfs' System.map)"
+          if grep -qiE 'susfs' System.map; then echo "WARNING: unexpected susfs symbols in the kernel"; fi
           grep -E 'KernelSU-Next (version|tag)|Hook mode' ../../build.log || true
           ls -la arch/arm64/boot/Image
+          cd /w/kernel
+
+          # Build the SUSFS LKM against this exact kernel. Best effort: a failure here does not fail the kernel build.
+          if [ "${BUILD_SUSFS_LKM:-1}" = 1 ]; then
+            set +e
+            (
+              set -ex
+              make -j"$(nproc)" $MK modules_prepare
+              SRC="$(grep -rlE 'susfs_guard_lkm' /w/susfs-lkm --include=Makefile --include=Kbuild | head -1)"
+              [ -n "$SRC" ] || { echo "no Makefile/Kbuild mentioning susfs_guard_lkm in the LKM repo"; exit 1; }
+              D="$(dirname "$SRC")"
+              echo "LKM source dir: $D"
+              make -j"$(nproc)" $MK KBUILD_MODPOST_WARN=1 M="$D" modules
+              KO="$(find "$D" -name 'susfs_guard_lkm*.ko' | head -1)"
+              [ -n "$KO" ] || { echo "no susfs_guard_lkm .ko produced"; exit 1; }
+              cp -f "$KO" /w/susfs_guard_lkm.ko
+              ls -la /w/susfs_guard_lkm.ko
+              strings /w/susfs_guard_lkm.ko | grep -m1 '^vermagic=' || true
+            )
+            [ -f /w/susfs_guard_lkm.ko ] || echo "WARNING: SUSFS LKM was NOT built (see log above); use a prebuilt .ko only if it matches this kernel"
+            set -e
+          fi
           EOF
           chmod +x ci-build.sh
 
@@ -293,6 +307,7 @@ jobs:
           docker run --rm \
             -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
             -e DISABLE_SECCOMP="$DISABLE_SECCOMP" \
+            -e BUILD_SUSFS_LKM="$BUILD_SUSFS_LKM" \
             -v "$PWD":/w \
             -v "$HOME/clang":/clang:ro \
             "$BUILD_IMAGE" bash /w/ci-build.sh
@@ -306,9 +321,9 @@ jobs:
           rm -rf .git .github README.md patch ramdisk
           mkdir -p ramdisk patch
           cat > anykernel.sh <<'EOF'
-          ### AnyKernel3 - POCO F5 (marble) GKI 5.10 kernel + NoMount + KernelSU-Next + SUSFS
+          ### AnyKernel3 - POCO F5 (marble) GKI 5.10 kernel + NoMount + KernelSU-Next (SUSFS via LKM)
           properties() { '
-          kernel.string=marble 5.10.269 GKI | NoMount + KernelSU-Next + SUSFS | Android clang built
+          kernel.string=marble 5.10.269 GKI | NoMount + KernelSU-Next + SUSFS LKM | Android clang built
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -339,7 +354,7 @@ jobs:
           zip -qr9 ../marble-nomount-ksun.zip .
           cd ..
           cp kernel/out/arch/arm64/boot/Image Image
-          sha256sum marble-nomount-ksun.zip Image | tee SHA256SUMS
+          if [ -f susfs_guard_lkm.ko ]; then sha256sum marble-nomount-ksun.zip Image susfs_guard_lkm.ko | tee SHA256SUMS; else sha256sum marble-nomount-ksun.zip Image | tee SHA256SUMS; fi
 
       - name: Upload result
         if: always()
@@ -350,9 +365,8 @@ jobs:
           path: |
             marble-nomount-ksun.zip
             Image
+            susfs_guard_lkm.ko
             SHA256SUMS
             build.log
             config.diff
-
-
             
