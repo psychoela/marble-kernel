@@ -164,33 +164,44 @@ jobs:
         run: |
           set -eu
           cd kernel
-          git fetch -q --depth 1 "$STABLE_REPO" tag "$STABLE_FROM" tag "$STABLE_TO"
-          git diff "$STABLE_FROM" "$STABLE_TO" -- . ':!Makefile' > ../stable.diff
-          TOTAL="$(git diff --name-only "$STABLE_FROM" "$STABLE_TO" -- . ':!Makefile' | wc -l)"
-          echo "stable $STABLE_FROM -> $STABLE_TO touches $TOTAL files"
-          CONF=""
-          if git apply --3way ../stable.diff; then
-            echo "OK: applied cleanly"
-          else
-            CONF="$(git diff --name-only --diff-filter=U)"
-            [ -n "$CONF" ] || { echo "ERROR: apply failed without conflicts (see messages above)"; exit 1; }
-            # Conflicts are in vendor-modified files (e.g. Qualcomm drivers): keep the vendor version
-            # of those files and take the stable changes for everything else.
-            for f in $CONF; do git checkout HEAD -- "$f"; done
-            [ -z "$(git diff --name-only --diff-filter=U)" ] || { echo "ERROR: still unmerged files"; exit 1; }
+          # Apply the stable commits ONE BY ONE. A commit that does not apply cleanly on top of the
+          # vendor tree is skipped as a whole (never half applied), so header/source pairs stay consistent.
+          git fetch -q --depth 1 "$STABLE_REPO" tag "$STABLE_FROM"
+          if ! git fetch -q --shallow-exclude="$STABLE_FROM" "$STABLE_REPO" tag "$STABLE_TO"; then
+            echo "shallow-exclude not supported by the server, falling back to a deeper fetch"
+            git fetch -q --depth 1500 "$STABLE_REPO" tag "$STABLE_TO"
           fi
+          git rev-list --reverse --no-merges "$STABLE_FROM..$STABLE_TO" > ../stable-commits.txt
+          TOTAL="$(wc -l < ../stable-commits.txt)"
+          echo "stable $STABLE_FROM -> $STABLE_TO: $TOTAL commits"
+          [ "$TOTAL" -gt 0 ] || { echo "ERROR: no commits found in the range"; exit 1; }
+          : > ../stable-skipped.txt
+          APPLIED=0; SKIPPED=0; EMPTY=0
+          while read -r c; do
+            par="$(git cat-file -p "$c" | awk '/^parent /{print $2; exit}')"
+            git diff --binary "$par" "$c" -- . ':!Makefile' > ../one.diff
+            if [ ! -s ../one.diff ]; then EMPTY=$((EMPTY+1)); continue; fi
+            if git apply --3way ../one.diff < /dev/null > /dev/null 2>&1; then
+              git -c user.name=ci -c user.email=ci@localhost commit -q --allow-empty -m "stable: $c" < /dev/null
+              APPLIED=$((APPLIED+1))
+            else
+              git reset -q --hard HEAD
+              SKIPPED=$((SKIPPED+1))
+              git log -1 --format='%h %s' "$c" >> ../stable-skipped.txt
+            fi
+          done < ../stable-commits.txt
+          echo "applied=$APPLIED skipped=$SKIPPED empty/Makefile-only=$EMPTY of $TOTAL"
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile | head -3
           {
             echo "### Stable update $STABLE_FROM -> $STABLE_TO"
-            echo "Files in the stable diff: $TOTAL"
-            echo "Skipped because of conflicts (vendor version kept):"
+            echo "Commits: $TOTAL, applied: $APPLIED, skipped (conflict with vendor code): $SKIPPED, empty: $EMPTY"
             echo '```'
-            echo "${CONF:-none}"
+            head -200 ../stable-skipped.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "=============================="
-          echo "SKIPPED (conflict, vendor version kept):"
-          echo "${CONF:-none}"
+          echo "SKIPPED COMMITS (first 60):"
+          head -60 ../stable-skipped.txt
 
       - name: Apply SUSFS kernel patches
         run: |
@@ -341,6 +352,17 @@ jobs:
             -v "$HOME/clang":/clang:ro \
             "$BUILD_IMAGE" bash /w/ci-build.sh
 
+      - name: Show first compile errors in the run summary
+        if: failure()
+        run: |
+          [ -f build.log ] || exit 0
+          {
+            echo "### First compile errors (build.log)"
+            echo '```'
+            grep -nE 'error:|fatal error|undefined reference|undeclared|implicit declaration' build.log | head -25 | cut -c1-300
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Package AnyKernel3 zip
         run: |
           set -eux
@@ -397,6 +419,5 @@ jobs:
             SHA256SUMS
             build.log
             config.diff
-
 
             
