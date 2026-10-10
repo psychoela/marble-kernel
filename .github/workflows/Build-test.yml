@@ -28,7 +28,7 @@ on:
         description: "5.10 sublevel to build"
         default: "271"
       on_conflict:
-        description: "If the 271 stable delta conflicts with Google's tree: ours = keep Google's version of those files (skip their stable fixes), fail = stop"
+        description: "If the 271 stable delta conflicts with Google's tree: ours = skip any stable commit that conflicts (keeps tree consistent), fail = stop at first conflict"
         default: "ours"
       lto:
         description: "LTO mode: thin | full | none (full = stock, slow and RAM hungry on GitHub runners)"
@@ -112,25 +112,35 @@ jobs:
           echo "Google base = 5.10.${BASE_N} ($BASE_SHA)"
           git checkout -q "$BASE_SHA"
 
-          # 2) Google has not merged the requested sublevel yet -> apply upstream stable delta
+          # 2) Google has not merged the requested sublevel yet -> cherry-pick upstream stable
+          #    commits one by one; a commit that conflicts is skipped as a whole, so a header and
+          #    the .c file that needs it are never split apart.
           if [ "$BASE_N" -lt "$SUBLEVEL" ]; then
-            echo "::warning::Google has no 5.10.${SUBLEVEL} yet; applying upstream stable diff v5.10.${BASE_N}..v5.10.${SUBLEVEL} onto Google 5.10.${BASE_N} (experimental)"
-            git fetch -q --depth=1 "$STABLE_URL" "refs/tags/v5.10.${BASE_N}:refs/tags/v5.10.${BASE_N}"
-            git fetch -q --depth=1 "$STABLE_URL" "refs/tags/v5.10.${SUBLEVEL}:refs/tags/v5.10.${SUBLEVEL}" \
-              || { echo "::error::upstream tag v5.10.${SUBLEVEL} not found on kernel.org stable"; exit 1; }
-            git diff --binary "v5.10.${BASE_N}" "v5.10.${SUBLEVEL}" > ../stable.patch
-            wc -l ../stable.patch
-            if ! git apply --3way --index ../stable.patch; then
-              git diff --name-only --diff-filter=U > ../conflicts.txt
-              echo "::warning::$(wc -l < ../conflicts.txt) file(s) conflict between stable delta and Google's tree:"
-              cat ../conflicts.txt
-              if [ "${{ inputs.on_conflict }}" = "fail" ]; then exit 1; fi
-              # keep Google's version of each conflicted file (their stable change is NOT applied)
-              xargs -a ../conflicts.txt git checkout --ours --
-              xargs -a ../conflicts.txt git add --
-              ! git diff --name-only --diff-filter=U | grep -q . || { echo "::error::unresolved files remain"; exit 1; }
-            fi
-            git commit -q -m "Merge 5.10.${SUBLEVEL} stable delta into Google 5.10.${BASE_N} (local)"
+            echo "::warning::Google has no 5.10.${SUBLEVEL} yet; cherry-picking upstream v5.10.${BASE_N}..v5.10.${SUBLEVEL} onto Google 5.10.${BASE_N} (experimental)"
+            git fetch -q --shallow-exclude="v5.10.$((BASE_N-1))" "$STABLE_URL" \
+              "refs/tags/v5.10.${BASE_N}:refs/tags/v5.10.${BASE_N}" \
+              "refs/tags/v5.10.${SUBLEVEL}:refs/tags/v5.10.${SUBLEVEL}" \
+              || { echo "::error::upstream tags not fetchable from kernel.org stable"; exit 1; }
+            git rev-list --reverse --no-merges "v5.10.${SUBLEVEL}" "^v5.10.${BASE_N}" > ../stable-commits.txt
+            echo "$(wc -l < ../stable-commits.txt) upstream commits to apply"
+            : > ../skipped.txt; ok=0; skip=0
+            while read -r c; do
+              if git cherry-pick -x "$c" >/dev/null 2>&1; then
+                ok=$((ok+1))
+              else
+                git cherry-pick --abort >/dev/null 2>&1 || git reset -q --hard HEAD
+                skip=$((skip+1))
+                git log -1 --format='%h %s' "$c" >> ../skipped.txt
+                if [ "${{ inputs.on_conflict }}" = "fail" ]; then
+                  echo "::error::conflict on $(git log -1 --format='%h %s' "$c")"; exit 1
+                fi
+              fi
+            done < ../stable-commits.txt
+            echo "::warning::applied $ok upstream commits, skipped $skip (conflict/already in Google tree)"
+            echo "::group::skipped commits"; cat ../skipped.txt; echo "::endgroup::"
+            # version bump commits may have been skipped; force the sublevel
+            sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${SUBLEVEL}/" Makefile
+            git commit -qam "Makefile: SUBLEVEL = ${SUBLEVEL}" || true
           fi
 
           git log -1 --format='Source commit %h (%cd): %s' --date=short
