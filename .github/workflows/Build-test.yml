@@ -1,1 +1,220 @@
+name: Build Google GKI 5.10.271 + KernelSU-Next + NoMount (marble)
 
+# Source : Google android12-5.10-lts, merge commit "Merge 5.10.271 into android12-5.10-lts"
+#          (fetched from android.googlesource.com; the GitHub mirror is stale at 5.10.245)
+# Clang  : Android clang r563880c (21.0.0) - same as your current 5.10.269-gki
+# Root   : KernelSU-Next (latest release tag by default, or "dev")
+# Extra  : NoMount (github.com/maxsteeel/nomount) built into the kernel
+# Output : AnyKernel3 zip that only replaces the GKI Image (like Templar), version string
+#          "5.10.271-gki (PsychoAvy@github)"
+#
+# Run: Actions tab -> this workflow -> Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksun_ref:
+        description: "KernelSU-Next ref: empty = latest release tag, or 'dev' / a tag / a commit"
+        default: ""
+      nomount_ref:
+        description: "NoMount ref: empty = latest release tag, or 'dev' / a tag / a commit"
+        default: ""
+      clang_ver:
+        description: "Google clang version"
+        default: "r563880c"
+      sublevel:
+        description: "5.10 sublevel to build"
+        default: "271"
+      lto:
+        description: "LTO mode: thin | none"
+        default: "thin"
+
+env:
+  KSRC_URL: https://android.googlesource.com/kernel/common
+  CLANG_VER: ${{ inputs.clang_ver }}
+  SUBLEVEL: ${{ inputs.sublevel }}
+  CCACHE_DIR: /home/runner/.ccache
+  KBUILD_BUILD_USER: PsychoAvy
+  KBUILD_BUILD_HOST: github
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev lz4 zstd cpio rsync git curl \
+            python3 ccache zip xz-utils libncurses-dev dwarves
+
+      - name: Restore Google clang cache
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang
+          key: google-clang-${{ inputs.clang_ver }}
+
+      - name: Download Google clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/clang && cd ~/clang
+          ok=0
+          for ref in refs/heads/main refs/heads/master refs/heads/android16-release refs/heads/android15-release refs/heads/android15-qpr2-release; do
+            url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${ref}/clang-${CLANG_VER}.tar.gz"
+            echo "Trying $url"
+            if curl -fL --retry 3 -o clang.tgz "$url"; then
+              tar -xzf clang.tgz && rm -f clang.tgz && ok=1 && break
+            fi
+          done
+          if [ "$ok" != 1 ]; then
+            echo "::warning::Google clang ${CLANG_VER} not downloadable - falling back to kernel.org LLVM 21.1.8"
+            curl -fL --retry 3 -o llvm.tar.xz https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-21.1.8-x86_64.tar.xz
+            tar -xJf llvm.tar.xz --strip-components=1 && rm -f llvm.tar.xz
+          fi
+          ./bin/clang --version | head -1
+
+      - name: Fetch Google kernel source (5.10.${{ inputs.sublevel }})
+        run: |
+          mkdir kernel && cd kernel
+          git init -q
+          git remote add origin "$KSRC_URL"
+          SHA=""
+          for br in android12-5.10-lts android12-5.10; do
+            echo "== branch $br"
+            git fetch -q --filter=blob:none --shallow-since=2026-01-01 origin "refs/heads/$br" || continue
+            SHA=$(git log FETCH_HEAD -n1 --format=%H --grep="^Merge 5\.10\.${SUBLEVEL} into")
+            [ -n "$SHA" ] && break
+            echo "No 'Merge 5.10.${SUBLEVEL} into' commit on $br. Recent merges there:"
+            git log FETCH_HEAD --format='%h %cd %s' --date=short --grep='^Merge 5\.10\.' -n 8
+          done
+          [ -n "$SHA" ] || { echo "::error::Google merge commit for 5.10.${SUBLEVEL} not found"; exit 1; }
+          git checkout -q "$SHA"
+          git log -1 --format='Google commit %h (%cd): %s' --date=short
+          sed -n '2,5p' Makefile
+          grep -q "^SUBLEVEL = ${SUBLEVEL}$" Makefile
+          grep CLANG_VERSION build.config.constants || true   # Google pins an older clang; we override with ${CLANG_VER}
+
+      - name: Integrate KernelSU-Next
+        working-directory: kernel
+        run: |
+          curl -LSs https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh -o /tmp/ksun-setup.sh
+          if [ -n "${{ inputs.ksun_ref }}" ]; then
+            bash /tmp/ksun-setup.sh "${{ inputs.ksun_ref }}"
+          else
+            bash /tmp/ksun-setup.sh
+          fi
+          ls -l drivers/kernelsu
+          git -C KernelSU-Next describe --tags --always
+
+      - name: Integrate NoMount
+        working-directory: kernel
+        run: |
+          curl -LSs https://raw.githubusercontent.com/maxsteeel/nomount/dev/kernel/setup.sh -o /tmp/nomount-setup.sh
+          if [ -n "${{ inputs.nomount_ref }}" ]; then
+            bash /tmp/nomount-setup.sh "${{ inputs.nomount_ref }}"
+          else
+            bash /tmp/nomount-setup.sh
+          fi
+          ls -l fs/nomount
+          git -C NoMount describe --tags --always
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-gki510-${{ github.run_id }}
+          restore-keys: ccache-gki510-
+
+      - name: Configure
+        working-directory: kernel
+        run: |
+          export PATH="$HOME/clang/bin:$PATH"
+          clang --version | head -1
+          ccache --max-size=3G
+          A="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1"
+          make $A gki_defconfig
+
+          C="scripts/config --file out/.config"
+          $C --set-str LOCALVERSION "-gki"
+          $C -d LOCALVERSION_AUTO            # no "-dirty" / git hash suffix
+          $C -d WERROR
+          # Kleaf normally generates the KMI whitelist; plain make has none, so keep all symbols.
+          $C -d TRIM_UNUSED_KSYMS
+          $C -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES
+          # KernelSU-Next needs KPROBES + EXT4_FS
+          $C -e KPROBES -e KPROBE_EVENTS
+          $C -e KSU
+          $C -e NOMOUNT
+          if [ "${{ inputs.lto }}" = "none" ]; then
+            $C -d CFI_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
+          else
+            $C -d LTO_CLANG_FULL -e LTO_CLANG_THIN
+          fi
+          make $A olddefconfig
+
+          for s in CONFIG_KSU=y CONFIG_NOMOUNT=y CONFIG_KPROBES=y CONFIG_EXT4_FS=y CONFIG_MODVERSIONS=y; do
+            grep -qx "$s" out/.config || { echo "::error::$s missing in final .config"; exit 1; }
+          done
+          grep -E 'CONFIG_(KSU|NOMOUNT|KPROBES|LTO_CLANG_THIN|LTO_NONE|CFI_CLANG|PREEMPT|MODULE_UNLOAD|LOCALVERSION)=' out/.config
+
+      - name: Build Image
+        working-directory: kernel
+        run: |
+          export PATH="$HOME/clang/bin:$PATH"
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc)" Image 2>&1 | tee build.log | tail -n 40
+          test -f out/arch/arm64/boot/Image
+          make -s O=out ARCH=arm64 LLVM=1 kernelrelease | tee ../kernelrelease.txt
+          grep -a -m1 'Linux version' out/include/generated/compile.h out/include/generated/utsrelease.h 2>/dev/null || true
+          strings -a out/arch/arm64/boot/Image | grep -m1 'Linux version' | tee ../linux_banner.txt
+          ccache --show-stats
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git ak3
+          cd ak3
+          rm -rf .git .github
+          cp ../kernel/out/arch/arm64/boot/Image ./Image
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=Google GKI 5.10.271 + KernelSU-Next + NoMount (marble)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=marble
+          device.name2=marblein
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          EOF
+          zip -r9 "../GKI-5.10.${SUBLEVEL}-KSUN-NoMount-marble-${GITHUB_SHA::7}.zip" . -x '*.git*'
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-5.10.${{ inputs.sublevel }}-ksun-nomount-marble
+          path: |
+            GKI-5.10.*-KSUN-NoMount-marble-*.zip
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/.config
+            kernelrelease.txt
+            linux_banner.txt
+            kernel/build.log
+          if-no-files-found: error
+          
