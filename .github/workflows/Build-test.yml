@@ -1,6 +1,8 @@
 name: Build Google GKI 5.10.271 + KernelSU-Next + NoMount (marble)
 
-# Source : Google android12-5.10-lts, merge commit "Merge 5.10.271 into android12-5.10-lts"
+# Source : Google android12-5.10-lts, merge commit "Merge 5.10.N into android12-5.10-lts"
+#          (if Google lacks the requested sublevel, the newest older merge is used and the
+#           upstream kernel.org stable delta is applied on top - experimental)
 #          (fetched from android.googlesource.com; the GitHub mirror is stale at 5.10.245)
 # Clang  : Android clang r563880c (21.0.0) - same as your current 5.10.269-gki
 # Root   : KernelSU-Next (latest release tag by default, or "dev")
@@ -26,7 +28,7 @@ on:
         description: "5.10 sublevel to build"
         default: "271"
       lto:
-        description: "LTO mode: thin | none"
+        description: "LTO mode: thin | full | none (full = stock, slow and RAM hungry on GitHub runners)"
         default: "thin"
 
 env:
@@ -83,19 +85,43 @@ jobs:
         run: |
           mkdir kernel && cd kernel
           git init -q
+          git config user.name "PsychoAvy"
+          git config user.email "build@github"
           git remote add origin "$KSRC_URL"
-          SHA=""
+          STABLE_URL=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+
+          # 1) newest Google "Merge 5.10.N into" commit with N <= requested sublevel
+          BASE_SHA=""; BASE_N=0
           for br in android12-5.10-lts android12-5.10; do
             echo "== branch $br"
             git fetch -q --filter=blob:none --shallow-since=2026-01-01 origin "refs/heads/$br" || continue
-            SHA=$(git log FETCH_HEAD -n1 --format=%H --grep="^Merge 5\.10\.${SUBLEVEL} into")
-            [ -n "$SHA" ] && break
-            echo "No 'Merge 5.10.${SUBLEVEL} into' commit on $br. Recent merges there:"
-            git log FETCH_HEAD --format='%h %cd %s' --date=short --grep='^Merge 5\.10\.' -n 8
+            while read -r sha subj; do
+              n=$(echo "$subj" | sed -n 's/^Merge 5\.10\.\([0-9]*\) into.*/\1/p')
+              [ -n "$n" ] && [ "$n" -le "$SUBLEVEL" ] && [ "$n" -gt "$BASE_N" ] && { BASE_N=$n; BASE_SHA=$sha; } || true
+            done < <(git log FETCH_HEAD --format='%H %s' --grep='^Merge 5\.10\.' -n 40)
+            [ "$BASE_N" = "$SUBLEVEL" ] && break
           done
-          [ -n "$SHA" ] || { echo "::error::Google merge commit for 5.10.${SUBLEVEL} not found"; exit 1; }
-          git checkout -q "$SHA"
-          git log -1 --format='Google commit %h (%cd): %s' --date=short
+          [ -n "$BASE_SHA" ] || { echo "::error::no Google 5.10.x merge commit found"; exit 1; }
+          echo "Google base = 5.10.${BASE_N} ($BASE_SHA)"
+          git checkout -q "$BASE_SHA"
+
+          # 2) Google has not merged the requested sublevel yet -> apply upstream stable delta
+          if [ "$BASE_N" -lt "$SUBLEVEL" ]; then
+            echo "::warning::Google has no 5.10.${SUBLEVEL} yet; applying upstream stable diff v5.10.${BASE_N}..v5.10.${SUBLEVEL} onto Google 5.10.${BASE_N} (experimental)"
+            git fetch -q --depth=1 "$STABLE_URL" "refs/tags/v5.10.${BASE_N}:refs/tags/v5.10.${BASE_N}"
+            git fetch -q --depth=1 "$STABLE_URL" "refs/tags/v5.10.${SUBLEVEL}:refs/tags/v5.10.${SUBLEVEL}" \
+              || { echo "::error::upstream tag v5.10.${SUBLEVEL} not found on kernel.org stable"; exit 1; }
+            git diff --binary "v5.10.${BASE_N}" "v5.10.${SUBLEVEL}" > ../stable.patch
+            wc -l ../stable.patch
+            if ! git apply --3way --index ../stable.patch; then
+              echo "::error::stable delta conflicts with Google's tree:"
+              git diff --name-only --diff-filter=U
+              exit 1
+            fi
+            git commit -q -m "Merge 5.10.${SUBLEVEL} stable delta into Google 5.10.${BASE_N} (local)"
+          fi
+
+          git log -1 --format='Source commit %h (%cd): %s' --date=short
           sed -n '2,5p' Makefile
           grep -q "^SUBLEVEL = ${SUBLEVEL}$" Makefile
           grep CLANG_VERSION build.config.constants || true   # Google pins an older clang; we override with ${CLANG_VER}
@@ -151,17 +177,23 @@ jobs:
           $C -e KPROBES -e KPROBE_EVENTS
           $C -e KSU
           $C -e NOMOUNT
-          if [ "${{ inputs.lto }}" = "none" ]; then
-            $C -d CFI_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE
-          else
-            $C -d LTO_CLANG_FULL -e LTO_CLANG_THIN
-          fi
+          # Networking extras: BBR + Westwood (default stays cubic), qdiscs, TTL/HL target, WireGuard
+          $C -e TCP_CONG_ADVANCED -e TCP_CONG_BBR -e TCP_CONG_WESTWOOD -e TCP_CONG_CUBIC
+          $C --set-str DEFAULT_TCP_CONG "cubic"
+          $C -e NET_SCH_FQ -e NET_SCH_FQ_CODEL -e NET_SCH_CAKE
+          $C -e NETFILTER_ADVANCED -e NETFILTER_XT_TARGET_HL
+          $C -e WIREGUARD
+          case "${{ inputs.lto }}" in
+            none) $C -d CFI_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE ;;
+            full) $C -d LTO_CLANG_THIN -e LTO_CLANG_FULL ;;   # same as stock config
+            *)    $C -d LTO_CLANG_FULL -e LTO_CLANG_THIN ;;
+          esac
           make $A olddefconfig
 
-          for s in CONFIG_KSU=y CONFIG_NOMOUNT=y CONFIG_KPROBES=y CONFIG_EXT4_FS=y CONFIG_MODVERSIONS=y; do
+          for s in CONFIG_KSU=y CONFIG_NOMOUNT=y CONFIG_KPROBES=y CONFIG_EXT4_FS=y CONFIG_MODVERSIONS=y CONFIG_TCP_CONG_BBR=y CONFIG_TCP_CONG_WESTWOOD=y CONFIG_DEFAULT_TCP_CONG=\"cubic\" CONFIG_NET_SCH_FQ=y CONFIG_NET_SCH_FQ_CODEL=y CONFIG_NET_SCH_CAKE=y CONFIG_NETFILTER_XT_TARGET_HL=y CONFIG_WIREGUARD=y; do
             grep -qx "$s" out/.config || { echo "::error::$s missing in final .config"; exit 1; }
           done
-          grep -E 'CONFIG_(KSU|NOMOUNT|KPROBES|LTO_CLANG_THIN|LTO_NONE|CFI_CLANG|PREEMPT|MODULE_UNLOAD|LOCALVERSION)=' out/.config
+          grep -E 'CONFIG_(KSU|NOMOUNT|KPROBES|LTO_CLANG_THIN|LTO_CLANG_FULL|LTO_NONE|CFI_CLANG|PREEMPT|MODULE_UNLOAD|LOCALVERSION)=' out/.config
 
       - name: Build Image
         working-directory: kernel
