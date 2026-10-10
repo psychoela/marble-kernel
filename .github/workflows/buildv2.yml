@@ -1,1 +1,470 @@
+name: Build marble kernel (NoMount + KernelSU-Next, no SUSFS, shows as 6.12.25, Android clang 21 (r563880c), Debian container)
 
+on:
+  workflow_dispatch:
+
+env:
+  KERNEL_REPO: https://github.com/Evolution-X-Devices/kernel_xiaomi_sm8450
+  KERNEL_SHA: c3d1c3d93062911060e8460fdb88cab235f6603e
+  NOMOUNT_REPO: https://github.com/maxsteeel/nomount
+  NOMOUNT_SHA: 7e7342cd48841cfedd00be2fd20a0311f69c48c5
+  # Official KernelSU-Next (no SUSFS). The commit used is printed in the log.
+  # 24b9fdf = the dev commit whose manager CI build you wanted to match.
+  # Set KSUN_SHA to "" to use the branch tip instead.
+  KSUN_REPO: https://github.com/KernelSU-Next/KernelSU-Next
+  KSUN_BRANCH: dev
+  KSUN_SHA: "24b9fdf"
+  # Official stable release to compare against (only used for a check printed in the log).
+  KSUN_STABLE_TAG: v3.4.1
+  # Android clang to use. Change these two lines to try another toolchain.
+  CLANG_DIR: clang-r563880c
+  CLANG_MAJOR: "21"
+  EXPECTED_RELEASE: 5.10.269-gki-gc3d1c3d93062
+  BUILD_IMAGE: debian:bookworm-slim
+  # Version that apps see in `uname -r`, /proc/version and /proc/sys/kernel/osrelease.
+  # DISPLAY ONLY: the kernel itself stays 5.10.269. kernel.release, LINUX_VERSION_CODE and the
+  # module vermagic are NOT changed, so the vendor modules and KernelSU-Next build and load as before.
+  # Boot-critical Android daemons (bpfloader, netd, init, vintf, system_server, modprobe,
+  # ueventd, clatd) are still shown the real version, because they pick features by kernel version.
+  # Set to "" to turn this off completely (try that first if you ever bootloop).
+  UNAME_FAKE_VERSION: "6.12.25"
+  # Turn off seccomp in the whole kernel (CONFIG_SECCOMP + CONFIG_SECCOMP_FILTER).
+  # WARNING: this very likely breaks boot. It changes struct task_struct, so the
+  # vendor modules fail the modversions check, and Android's zygote expects seccomp.
+  # Keep "0" unless you accept the risk of a bootloop (set to "1" to try it).
+  DISABLE_SECCOMP: "0"
+
+jobs:
+  build:
+    # GitHub only offers Ubuntu/Windows/macOS hosts. The host is only used to run
+    # Docker; the whole kernel build happens inside a Debian container.
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout (for config.txt)
+        uses: actions/checkout@v4
+
+      - name: Check that config.txt is the phone's real kernel config
+        run: |
+          set -eu
+          test -s config.txt || { echo "config.txt missing in repo root"; exit 1; }
+          grep -q '^CONFIG_LTO_CLANG_FULL=y' config.txt
+          grep -q '^CONFIG_CFI_CLANG=y' config.txt
+          grep -q 'r563880c' config.txt
+          echo "config.txt looks right"
+
+      - name: Free disk space and add swap (host)
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          df -h / /mnt
+          free -g
+
+      - name: Download Android clang
+        run: |
+          set -eux
+          cat > fetch-clang.sh <<'EOF'
+          #!/bin/bash
+          # usage: fetch-clang.sh <repo-url> <clang-dir> <dest>
+          # Finds <clang-dir> in the Android prebuilts repo: current branch tips first, then history.
+          set -u
+          BASE="$1"; DIR="$2"; DEST="$3"
+          WORK="$(mktemp -d)"; cd "$WORK"
+
+          echo "== listing branches"
+          git ls-remote --heads "$BASE" | sed 's#.*refs/heads/##' > branches.txt || true
+          echo "branches: $(wc -l < branches.txt)"
+          : > cand.txt
+          grep -xE 'main-kernel|mirror-goog-main-llvm-toolchain-source|main|master' branches.txt >> cand.txt || true
+          grep -E '^android-?(1[4-9]|latest)|qpr|^android-?[0-9]+-release' branches.txt | grep -vE '^android-(gs|msm|exynos|arm64)' >> cand.txt || true
+          grep -iE 'llvm|clang|toolchain' branches.txt >> cand.txt || true
+          awk '!seen[$0]++' cand.txt | head -30 > cand.uniq
+          echo "candidate branches:"; cat cand.uniq
+
+          try_checkout() { # repo-dir ref
+            git -C "$1" sparse-checkout init --cone >/dev/null 2>&1
+            git -C "$1" sparse-checkout set "$DIR" >/dev/null 2>&1
+            git -C "$1" checkout -q "$2" 2>&1 | tail -2
+            [ -x "$1/$DIR/bin/clang" ]
+          }
+
+          found=0
+          while read -r b; do
+            [ -n "$b" ] || continue
+            echo "== checking branch $b"
+            rm -rf probe
+            if timeout 600 git clone -q --depth 1 --filter=blob:none --no-checkout --branch "$b" "$BASE" probe 2>/dev/null; then
+              if git -C probe ls-tree --name-only HEAD | grep -qx "$DIR"; then
+                echo "FOUND $DIR on branch $b"
+                if try_checkout probe HEAD; then mkdir -p "$DEST"; cp -a "probe/$DIR/." "$DEST/"; found=1; break; fi
+              fi
+            fi
+          done < cand.uniq
+
+          if [ "$found" != 1 ]; then
+            echo "== not on any branch tip, searching history of main-kernel"
+            rm -rf hist probe
+            if timeout 1500 git clone -q --filter=blob:none --no-checkout --branch main-kernel "$BASE" hist; then
+              del="$(timeout 1200 git -C hist log --diff-filter=D -1 --format=%H -- "$DIR")"
+              add="$(timeout 1200 git -C hist log --diff-filter=A -1 --format=%H -- "$DIR")"
+              echo "added in: ${add:-?}  deleted in: ${del:-?}"
+              ref=""
+              if [ -n "$del" ]; then ref="$del^"; elif [ -n "$add" ]; then ref="$add"; fi
+              if [ -n "$ref" ] && try_checkout hist "$ref"; then mkdir -p "$DEST"; cp -a "hist/$DIR/." "$DEST/"; found=1; fi
+            fi
+          fi
+
+          [ "$found" = 1 ] || { echo "ERROR: could not find $DIR"; exit 1; }
+          echo "OK: copied $DIR to $DEST"
+          EOF
+          mkdir -p "$HOME/clang"
+          bash fetch-clang.sh https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "$CLANG_DIR" "$HOME/clang"
+          "$HOME/clang/bin/clang" --version
+          "$HOME/clang/bin/clang" --version | grep -q "clang version $CLANG_MAJOR\." || { echo "Expected clang $CLANG_MAJOR but got something else. Check CLANG_DIR."; exit 1; }
+          du -sh "$HOME/clang"
+
+      - name: Fetch sources at pinned commits
+        run: |
+          set -eux
+          fetch_sha() { # url sha dir
+            git init -q "$3"
+            git -C "$3" remote add origin "$1"
+            git -C "$3" fetch -q --depth 1 origin "$2"
+            git -C "$3" checkout -q FETCH_HEAD
+          }
+          fetch_sha "$KERNEL_REPO" "$KERNEL_SHA" kernel
+          fetch_sha "$NOMOUNT_REPO" "$NOMOUNT_SHA" nomount
+          # KernelSU-Next: full history, its version number is computed from commit count
+          git clone -q --branch "$KSUN_BRANCH" "$KSUN_REPO" ksun
+          if [ -n "$KSUN_SHA" ]; then git -C ksun checkout -q "$KSUN_SHA"; fi
+          git -C ksun log -1 --format='KernelSU-Next %H %s'
+          test -f ksun/kernel/Kconfig || { echo "ERROR: ksun/kernel/Kconfig not found"; exit 1; }
+          git -C kernel log -1 --format='kernel %H %s'
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+
+      - name: Integrate NoMount and KernelSU-Next
+        run: |
+          set -eux
+          K="$PWD/kernel"
+
+          add_source() { # file, line to insert before the last "endmenu"
+            if ! grep -qF "$2" "$1"; then
+              awk -v line="$2" '/^endmenu/{l=NR} {a[NR]=$0} END{for(i=1;i<=NR;i++){if(i==l)print line; print a[i]}}' "$1" > "$1.tmp"
+              mv "$1.tmp" "$1"
+            fi
+          }
+
+          # NoMount: copy source into fs/nomount
+          mkdir -p "$K/fs/nomount"
+          cp -f nomount/kernel/src/* "$K/fs/nomount/"
+          grep -q nomount "$K/fs/Makefile" || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "$K/fs/Makefile"
+          add_source "$K/fs/Kconfig" 'source "fs/nomount/Kconfig"'
+
+          # KernelSU-Next: keep it a git repo inside the tree, symlink like its own setup.sh does
+          mv ksun "$K/KernelSU-Next"
+          ln -sfn ../KernelSU-Next/kernel "$K/drivers/kernelsu"
+          grep -q kernelsu "$K/drivers/Makefile" || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$K/drivers/Makefile"
+          add_source "$K/drivers/Kconfig" 'source "drivers/kernelsu/Kconfig"'
+
+          grep -n nomount "$K/fs/Makefile" "$K/fs/Kconfig"
+          grep -n kernelsu "$K/drivers/Makefile" "$K/drivers/Kconfig"
+
+      - name: Show the fake version in uname (display only)
+        if: env.UNAME_FAKE_VERSION != ''
+        run: |
+          set -eux
+          K="$PWD/kernel"
+
+          cat > "$K/include/linux/uname_spoof.h" <<'CEOF'
+          /* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef _LINUX_UNAME_SPOOF_H
+          #define _LINUX_UNAME_SPOOF_H
+
+          #include <linux/types.h>
+
+          /*
+           * Returns the release string to show to the current process. If a different
+           * version has to be shown, it is written to out (out may be the same buffer
+           * as real) and out is returned; otherwise real is returned untouched.
+           */
+          const char *uname_spoof_release(const char *real, char *out, size_t len);
+
+          #endif
+          CEOF
+
+          cat > "$K/kernel/uname_spoof.c" <<'CEOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * Display-only kernel version. The real kernel (UTS_RELEASE, LINUX_VERSION_CODE,
+           * module vermagic) is not touched. Android daemons that choose features by
+           * kernel version keep seeing the real version.
+           */
+          #include <linux/kernel.h>
+          #include <linux/sched.h>
+          #include <linux/string.h>
+          #include <linux/utsname.h>
+          #include <linux/uname_spoof.h>
+
+          #define UNAME_FAKE_VERSION "@FAKE@"
+
+          static const char * const real_version_comms[] = {
+          	"bpfloader", "netbpfload", "netd", "init", "vintf",
+          	"system_server", "modprobe", "ueventd", "clatd", NULL,
+          };
+
+          static bool caller_needs_real_version(void)
+          {
+          	const char *comm = current->comm;
+          	int i;
+
+          	for (i = 0; real_version_comms[i]; i++)
+          		if (strstr(comm, real_version_comms[i]))
+          			return true;
+          	return false;
+          }
+
+          const char *uname_spoof_release(const char *real, char *out, size_t len)
+          {
+          	char base[__NEW_UTS_LEN + 1];
+          	const char *dash;
+
+          	/* only touch 5.10.x releases, leave anything else alone */
+          	if (strncmp(real, "5.10.", 5) || caller_needs_real_version())
+          		return real;
+
+          	strlcpy(base, real, sizeof(base));
+          	dash = strchr(base, '-');
+          	snprintf(out, len, "%s%s", UNAME_FAKE_VERSION, dash ? dash : "");
+          	return out;
+          }
+          CEOF
+          sed -i "s/@FAKE@/$UNAME_FAKE_VERSION/" "$K/kernel/uname_spoof.c"
+          grep -n 'define UNAME_FAKE_VERSION' "$K/kernel/uname_spoof.c"
+          grep -q 'uname_spoof' "$K/kernel/Makefile" || printf '\nobj-y += uname_spoof.o\n' >> "$K/kernel/Makefile"
+
+          # Hook the three places where userspace reads the release string.
+          # Every anchor is asserted: if the source differs, this step fails instead of guessing.
+          python3 - "$K" <<'PYEOF'
+          import re, sys
+          K = sys.argv[1]
+
+          def read(p):
+              with open(f"{K}/{p}") as f:
+                  return f.read()
+
+          def write(p, s):
+              with open(f"{K}/{p}", "w") as f:
+                  f.write(s)
+
+          def add_include(s):
+              m = re.search(r'^#include <linux/[^\n]*\n', s, re.M)
+              assert m, "no #include <linux/...> line found"
+              return s[:m.end()] + '#include <linux/uname_spoof.h>\n' + s[m.end():]
+
+          # 1) uname(2): newuname only (arm64 maps uname and compat uname to it)
+          p = "kernel/sys.c"
+          s = read(p)
+          i = s.index("SYSCALL_DEFINE1(newuname,")
+          tag = "up_read(&uts_sem);"
+          j = s.index(tag, i)
+          assert j - i < 600, "up_read(&uts_sem) is not inside newuname"
+          j += len(tag)
+          s = s[:j] + "\n\tuname_spoof_release(tmp.release, tmp.release, sizeof(tmp.release));" + s[j:]
+          write(p, add_include(s))
+
+          # 2) /proc/sys/kernel/osrelease
+          p = "kernel/utsname_sysctl.c"
+          s = read(p)
+          old = "memcpy(tmp_data, get_uts(table), sizeof(tmp_data));\n\tup_read(&uts_sem);\n"
+          assert s.count(old) == 1, "utsname_sysctl.c anchor not found exactly once"
+          new = old + '\tif (!write && table->procname && !strcmp(table->procname, "osrelease"))\n\t\tuname_spoof_release(tmp_data, tmp_data, sizeof(tmp_data));\n'
+          write(p, add_include(s.replace(old, new)))
+
+          # 3) /proc/version
+          p = "fs/proc/version.c"
+          s = read(p)
+          s, n = re.subn(r'(static int version_proc_show\(struct seq_file \*m, void \*v\)\s*\{\n)', r'\1\tchar spoof_rel[__NEW_UTS_LEN + 1];\n\n', s, count=1)
+          assert n == 1, "version_proc_show not found"
+          assert s.count("utsname()->release,") == 1, "utsname()->release anchor not found exactly once"
+          s = s.replace("utsname()->release,", "uname_spoof_release(utsname()->release, spoof_rel, sizeof(spoof_rel)),")
+          write(p, add_include(s))
+          print("uname hooks applied")
+          PYEOF
+
+          grep -n -B1 -A2 'uname_spoof_release' "$K/kernel/sys.c" "$K/kernel/utsname_sysctl.c" "$K/fs/proc/version.c"
+
+      - name: Check whether this KernelSU-Next already contains the official stable release
+        continue-on-error: true
+        run: |
+          set -eu
+          cd kernel/KernelSU-Next
+          git fetch -q https://github.com/KernelSU-Next/KernelSU-Next tag "$KSUN_STABLE_TAG"
+          TAGSHA="$(git rev-parse FETCH_HEAD^{commit})"
+          echo "official $KSUN_STABLE_TAG = $TAGSHA"
+          echo "kernel KSU-Next commit = $(git rev-parse HEAD)"
+          if git merge-base --is-ancestor "$TAGSHA" HEAD; then
+            echo "OK: this kernel includes the official $KSUN_STABLE_TAG release."
+          else
+            echo "NOTE: this kernel does NOT include official $KSUN_STABLE_TAG."
+          fi
+
+      - name: Write in-container build script
+        run: |
+          cat > ci-build.sh <<'EOF'
+          #!/bin/bash
+          # Runs INSIDE the Debian container. /w = workspace, /clang = Android clang
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            flex bison bc cpio libssl-dev libelf-dev xz-utils python3 binutils \
+            make gcc g++ git ca-certificates curl python-is-python3 perl
+          head -2 /etc/os-release
+          # repo is owned by another uid than root: let git (used by Kbuild) work anyway
+          git config --global --add safe.directory '*'
+          export PATH=/clang/bin:$PATH
+          clang --version | sed -n 1p
+          cd /w/kernel
+          MK="ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ O=out LOCALVERSION="
+
+          mkdir -p out
+          cp ../config.txt out/.config
+          printf 'CONFIG_NOMOUNT=y\nCONFIG_KSU=y\n' >> out/.config
+          # Use tracepoint hook mode when this KernelSU-Next offers it (ignored otherwise)
+          if grep -rqE 'config KSU_TRACEPOINT_HOOK' /w/kernel/KernelSU-Next/kernel --include='Kconfig*'; then
+            echo 'CONFIG_KSU_TRACEPOINT_HOOK=y' >> out/.config
+          fi
+          # TCP BBR + Westwood (+ fq qdisc, which BBR works best with). Selectable at runtime; the default stays cubic.
+          printf 'CONFIG_TCP_CONG_ADVANCED=y\nCONFIG_TCP_CONG_BBR=y\nCONFIG_TCP_CONG_WESTWOOD=y\nCONFIG_NET_SCH_FQ=y\n' >> out/.config
+          # fq_codel + cake qdiscs, TTL/HL iptables target (hotspot TTL), WireGuard VPN
+          printf 'CONFIG_NET_SCH_FQ_CODEL=y\nCONFIG_NET_SCH_CAKE=y\nCONFIG_NETFILTER_XT_TARGET_HL=y\nCONFIG_WIREGUARD=y\n' >> out/.config
+          grep -rnE 'config KSU_[A-Z0-9_]*HOOK' /w/kernel/KernelSU-Next/kernel --include='Kconfig*' || true
+
+          # Optional: seccomp off (see DISABLE_SECCOMP in the workflow env)
+          if [ "${DISABLE_SECCOMP:-0}" = 1 ]; then
+            sed -i 's/^CONFIG_SECCOMP=y/# CONFIG_SECCOMP is not set/; s/^CONFIG_SECCOMP_FILTER=y/# CONFIG_SECCOMP_FILTER is not set/' out/.config
+          fi
+          # newer clang adds new warnings; do not let CONFIG_WERROR turn them into errors
+          sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
+          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-gki-gc3d1c3d93062"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
+          make $MK olddefconfig
+          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|NOMOUNT|KSU|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES|LOCALVERSION)=' out/.config
+          # These must survive olddefconfig, otherwise vendor modules will not load
+          grep -q '^CONFIG_NOMOUNT=y' out/.config
+          grep -q '^CONFIG_KSU=y' out/.config
+          grep -q '^CONFIG_TCP_CONG_BBR=y' out/.config
+          grep -q '^CONFIG_TCP_CONG_WESTWOOD=y' out/.config
+          grep -q '^CONFIG_NET_SCH_FQ=y' out/.config
+          grep -q '^CONFIG_NET_SCH_FQ_CODEL=y' out/.config
+          grep -q '^CONFIG_NET_SCH_CAKE=y' out/.config
+          grep -q '^CONFIG_NETFILTER_XT_TARGET_HL=y' out/.config
+          grep -q '^CONFIG_WIREGUARD=y' out/.config
+          grep -E '^CONFIG_KSU' out/.config
+          grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config
+          grep -q '^CONFIG_CFI_CLANG=y' out/.config
+          grep -E '^CONFIG_(SECCOMP|SECCOMP_FILTER)=' out/.config || true
+          if [ "${DISABLE_SECCOMP:-0}" = 1 ] && grep -q '^CONFIG_SECCOMP=y' out/.config; then echo "ERROR: CONFIG_SECCOMP is still on"; exit 1; fi
+          diff <(grep -E '^(CONFIG_|# CONFIG_)' ../config.txt | sort) <(grep -E '^(CONFIG_|# CONFIG_)' out/.config | sort) > ../config.diff || true
+          echo "--- config differences against the phone config:"
+          cat ../config.diff
+
+          if ! make -j"$(nproc)" $MK KBUILD_BUILD_USER=PsychoAvy KBUILD_BUILD_HOST=github Image > ../build.log 2>&1; then
+            echo "BUILD FAILED, errors:"
+            grep -nE 'error|Error' ../build.log | head -60 || true
+            echo "last 60 lines:"; tail -60 ../build.log
+            exit 1
+          fi
+          tail -5 ../build.log
+
+          cd out
+          rel="$(cat include/config/kernel.release)"
+          echo "kernel.release = $rel"
+          # the real release (and so the module vermagic) must be unchanged
+          [ "$rel" = "$EXPECTED_RELEASE" ]
+          strings -n 8 arch/arm64/boot/Image | grep -m1 'Linux version 5.10'
+          strings arch/arm64/boot/Image | grep -qx "$EXPECTED_RELEASE SMP preempt mod_unload modversions aarch64"
+          if [ -n "${UNAME_FAKE_VERSION:-}" ]; then
+            strings arch/arm64/boot/Image | grep -qF "$UNAME_FAKE_VERSION"
+            echo "uname will show $UNAME_FAKE_VERSION to normal apps"
+          fi
+          echo "nomount symbols: $(grep -cE ' [tT] nm_' System.map)"
+          echo "ksu symbols: $(grep -ciE 'ksu' System.map)"
+          echo "susfs symbols (informational): $(grep -ciE 'susfs' System.map)"
+          grep -E 'KernelSU-Next (version|tag)|Hook mode' ../../build.log || true
+          ls -la arch/arm64/boot/Image
+          EOF
+          chmod +x ci-build.sh
+
+      - name: Configure, build and verify (inside Debian container)
+        run: |
+          set -eux
+          docker run --rm \
+            -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
+            -e DISABLE_SECCOMP="$DISABLE_SECCOMP" \
+            -e UNAME_FAKE_VERSION="$UNAME_FAKE_VERSION" \
+            -v "$PWD"
+            -v "$HOME/clang":/clang:ro \
+            "$BUILD_IMAGE" bash /w/ci-build.sh
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -eux
+          test -f kernel/out/arch/arm64/boot/Image
+          git clone -q --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git .github README.md patch ramdisk
+          mkdir -p ramdisk patch
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 - POCO F5 (marble) GKI 5.10 kernel + NoMount + KernelSU-Next
+          properties() { '
+          kernel.string=marble 5.10.269 GKI (shown as 6.12.25) | NoMount + KernelSU-Next | Android clang built
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=marble
+          device.name2=marblein
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          # GKI boot image (header v4): only the kernel is replaced, ramdisk untouched
+          split_boot;
+          flash_boot;
+          EOF
+          cp ../kernel/out/arch/arm64/boot/Image Image
+          zip -qr9 ../marble-nomount-ksun.zip .
+          cd ..
+          cp kernel/out/arch/arm64/boot/Image Image
+          sha256sum marble-nomount-ksun.zip Image | tee SHA256SUMS
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-kernel
+          if-no-files-found: warn
+          path: |
+            marble-nomount-ksun.zip
+            Image
+            SHA256SUMS
+            build.log
+            config.diff
+            
