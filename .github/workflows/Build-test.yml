@@ -1,1 +1,387 @@
+name: Build marble kernel (NoMount + KernelSU-Next + SUSFS, Android clang 21 (r563880c), Debian container)
+
+on:
+  workflow_dispatch:
+    inputs:
+      merge_stable:
+        description: "EXPERIMENTAL: apply upstream stable 5.10.269 -> 5.10.271 to the kernel (may break modules/boot)"
+        type: boolean
+        default: false
+
+env:
+  KERNEL_REPO: https://github.com/Evolution-X-Devices/kernel_xiaomi_sm8450
+  KERNEL_SHA: c3d1c3d93062911060e8460fdb88cab235f6603e
+  NOMOUNT_REPO: https://github.com/maxsteeel/nomount
+  NOMOUNT_SHA: 7e7342cd48841cfedd00be2fd20a0311f69c48c5
+  # KernelSU-Next with SUSFS built in (pershoot's dev-susfs branch).
+  # KSUN_SHA empty = branch tip. The commit used is printed in the log: paste it here to pin it.
+  KSUN_REPO: https://github.com/pershoot/KernelSU-Next
+  KSUN_BRANCH: dev-susfs
+  KSUN_SHA: ""
+  # Official stable release to compare against (only used for a check printed in the log).
+  KSUN_STABLE_TAG: v3.4.1
+  # SUSFS kernel patches (simonpunk). SUSFS_SHA empty = branch tip, printed in the log.
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
+  SUSFS_BRANCH: gki-android12-5.10
+  SUSFS_SHA: ""
+  # Android clang to use. Change these two lines to try another toolchain.
+  CLANG_DIR: clang-r563880c
+  CLANG_MAJOR: "21"
+  EXPECTED_RELEASE: 5.10.269-gki-gc3d1c3d93062
+  # Optional upstream stable update (only when the merge_stable box is ticked when running).
+  # The top-level Makefile is NOT touched, so SUBLEVEL stays 269 and the kernel release
+  # string stays the same as the stock one (vendor modules check it).
+  STABLE_REPO: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+  STABLE_FROM: v5.10.269
+  STABLE_TO: v5.10.271
+  BUILD_IMAGE: debian:bookworm-slim
+  # Turn off seccomp in the whole kernel (CONFIG_SECCOMP + CONFIG_SECCOMP_FILTER).
+  # WARNING: this very likely breaks boot. It changes struct task_struct, so the
+  # vendor modules fail the modversions check, and Android's zygote expects seccomp.
+  # Keep "0" unless you accept the risk of a bootloop (set to "1" to try it).
+  DISABLE_SECCOMP: "0"
+
+jobs:
+  build:
+    # GitHub only offers Ubuntu/Windows/macOS hosts. The host is only used to run
+    # Docker; the whole kernel build happens inside a Debian container.
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout (for config.txt)
+        uses: actions/checkout@v4
+
+      - name: Check that config.txt is the phone's real kernel config
+        run: |
+          set -eu
+          test -s config.txt || { echo "config.txt missing in repo root"; exit 1; }
+          grep -q '^CONFIG_LTO_CLANG_FULL=y' config.txt
+          grep -q '^CONFIG_CFI_CLANG=y' config.txt
+          grep -q 'r563880c' config.txt
+          echo "config.txt looks right"
+
+      - name: Free disk space and add swap (host)
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          df -h / /mnt
+          free -g
+
+      - name: Download Android clang
+        run: |
+          set -eux
+          cat > fetch-clang.sh <<'EOF'
+          #!/bin/bash
+          # usage: fetch-clang.sh <repo-url> <clang-dir> <dest>
+          # Finds <clang-dir> in the Android prebuilts repo: current branch tips first, then history.
+          set -u
+          BASE="$1"; DIR="$2"; DEST="$3"
+          WORK="$(mktemp -d)"; cd "$WORK"
+
+          echo "== listing branches"
+          git ls-remote --heads "$BASE" | sed 's#.*refs/heads/##' > branches.txt || true
+          echo "branches: $(wc -l < branches.txt)"
+          : > cand.txt
+          grep -xE 'main-kernel|mirror-goog-main-llvm-toolchain-source|main|master' branches.txt >> cand.txt || true
+          grep -E '^android-?(1[4-9]|latest)|qpr|^android-?[0-9]+-release' branches.txt | grep -vE '^android-(gs|msm|exynos|arm64)' >> cand.txt || true
+          grep -iE 'llvm|clang|toolchain' branches.txt >> cand.txt || true
+          awk '!seen[$0]++' cand.txt | head -30 > cand.uniq
+          echo "candidate branches:"; cat cand.uniq
+
+          try_checkout() { # repo-dir ref
+            git -C "$1" sparse-checkout init --cone >/dev/null 2>&1
+            git -C "$1" sparse-checkout set "$DIR" >/dev/null 2>&1
+            git -C "$1" checkout -q "$2" 2>&1 | tail -2
+            [ -x "$1/$DIR/bin/clang" ]
+          }
+
+          found=0
+          while read -r b; do
+            [ -n "$b" ] || continue
+            echo "== checking branch $b"
+            rm -rf probe
+            if timeout 600 git clone -q --depth 1 --filter=blob:none --no-checkout --branch "$b" "$BASE" probe 2>/dev/null; then
+              if git -C probe ls-tree --name-only HEAD | grep -qx "$DIR"; then
+                echo "FOUND $DIR on branch $b"
+                if try_checkout probe HEAD; then mkdir -p "$DEST"; cp -a "probe/$DIR/." "$DEST/"; found=1; break; fi
+              fi
+            fi
+          done < cand.uniq
+
+          if [ "$found" != 1 ]; then
+            echo "== not on any branch tip, searching history of main-kernel"
+            rm -rf hist probe
+            if timeout 1500 git clone -q --filter=blob:none --no-checkout --branch main-kernel "$BASE" hist; then
+              del="$(timeout 1200 git -C hist log --diff-filter=D -1 --format=%H -- "$DIR")"
+              add="$(timeout 1200 git -C hist log --diff-filter=A -1 --format=%H -- "$DIR")"
+              echo "added in: ${add:-?}  deleted in: ${del:-?}"
+              ref=""
+              if [ -n "$del" ]; then ref="$del^"; elif [ -n "$add" ]; then ref="$add"; fi
+              if [ -n "$ref" ] && try_checkout hist "$ref"; then mkdir -p "$DEST"; cp -a "hist/$DIR/." "$DEST/"; found=1; fi
+            fi
+          fi
+
+          [ "$found" = 1 ] || { echo "ERROR: could not find $DIR"; exit 1; }
+          echo "OK: copied $DIR to $DEST"
+          EOF
+          mkdir -p "$HOME/clang"
+          bash fetch-clang.sh https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "$CLANG_DIR" "$HOME/clang"
+          "$HOME/clang/bin/clang" --version
+          "$HOME/clang/bin/clang" --version | grep -q "clang version $CLANG_MAJOR\." || { echo "Expected clang $CLANG_MAJOR but got something else. Check CLANG_DIR."; exit 1; }
+          du -sh "$HOME/clang"
+
+      - name: Fetch sources at pinned commits
+        run: |
+          set -eux
+          fetch_sha() { # url sha dir
+            git init -q "$3"
+            git -C "$3" remote add origin "$1"
+            git -C "$3" fetch -q --depth 1 origin "$2"
+            git -C "$3" checkout -q FETCH_HEAD
+          }
+          fetch_sha "$KERNEL_REPO" "$KERNEL_SHA" kernel
+          fetch_sha "$NOMOUNT_REPO" "$NOMOUNT_SHA" nomount
+          # KernelSU-Next (SUSFS branch): full history, its version number is computed from commit count
+          git clone -q --branch "$KSUN_BRANCH" "$KSUN_REPO" ksun
+          if [ -n "$KSUN_SHA" ]; then git -C ksun checkout -q "$KSUN_SHA"; fi
+          git -C ksun log -1 --format='KernelSU-Next %H %s'
+          grep -rq 'config KSU_SUSFS' ksun/kernel || { echo "ERROR: this KernelSU-Next branch has no SUSFS support"; exit 1; }
+          # SUSFS kernel patches
+          git clone -q --branch "$SUSFS_BRANCH" "$SUSFS_REPO" susfs
+          if [ -n "$SUSFS_SHA" ]; then git -C susfs checkout -q "$SUSFS_SHA"; fi
+          git -C susfs log -1 --format='susfs %H %s'
+          ls susfs/kernel_patches
+          git -C kernel log -1 --format='kernel %H %s'
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+
+      - name: Apply upstream stable update (optional)
+        if: ${{ inputs.merge_stable }}
+        run: |
+          set -eu
+          cd kernel
+          git fetch -q --depth 1 "$STABLE_REPO" tag "$STABLE_FROM" tag "$STABLE_TO"
+          git diff "$STABLE_FROM" "$STABLE_TO" -- . ':!Makefile' > ../stable.diff
+          git diff --stat "$STABLE_FROM" "$STABLE_TO" -- . ':!Makefile' | tail -1
+          if ! git apply --3way ../stable.diff; then
+            echo "ERROR: conflicts while applying $STABLE_FROM -> $STABLE_TO. Conflicted files:"
+            git diff --name-only --diff-filter=U
+            echo "----- conflict hunks (first 200 lines)"
+            git diff --diff-filter=U | head -200
+            exit 1
+          fi
+          echo "OK: applied $STABLE_FROM -> $STABLE_TO cleanly"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile | head -3
+
+      - name: Apply SUSFS kernel patches
+        run: |
+          set -eux
+          K="$PWD/kernel"
+          P="$(ls susfs/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -1)"
+          [ -n "$P" ] || { echo "ERROR: no 50_add_susfs_in_*.patch in the SUSFS branch"; exit 1; }
+          P="$PWD/$P"
+          echo "using $P"
+          if [ -d susfs/kernel_patches/fs ]; then cp -f susfs/kernel_patches/fs/* "$K/fs/"; fi
+          if [ -d susfs/kernel_patches/include/linux ]; then cp -f susfs/kernel_patches/include/linux/* "$K/include/linux/"; fi
+          cd "$K"
+          if ! patch -p1 -N --no-backup-if-mismatch < "$P"; then
+            echo "SUSFS patch did not apply cleanly. Rejected hunks:"
+            find . -name '*.rej' -exec sh -c 'echo "=== $1"; cat "$1"' _ {} \;
+            exit 1
+          fi
+          grep -rn 'define SUSFS_VERSION' include/linux/ | head -3
+
+      - name: Integrate NoMount and KernelSU-Next
+        run: |
+          set -eux
+          K="$PWD/kernel"
+
+          add_source() { # file, line to insert before the last "endmenu"
+            if ! grep -qF "$2" "$1"; then
+              awk -v line="$2" '/^endmenu/{l=NR} {a[NR]=$0} END{for(i=1;i<=NR;i++){if(i==l)print line; print a[i]}}' "$1" > "$1.tmp"
+              mv "$1.tmp" "$1"
+            fi
+          }
+
+          # NoMount: copy source into fs/nomount
+          mkdir -p "$K/fs/nomount"
+          cp -f nomount/kernel/src/* "$K/fs/nomount/"
+          grep -q nomount "$K/fs/Makefile" || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "$K/fs/Makefile"
+          add_source "$K/fs/Kconfig" 'source "fs/nomount/Kconfig"'
+
+          # KernelSU-Next: keep it a git repo inside the tree, symlink like its own setup.sh does
+          mv ksun "$K/KernelSU-Next"
+          ln -sfn ../KernelSU-Next/kernel "$K/drivers/kernelsu"
+          grep -q kernelsu "$K/drivers/Makefile" || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$K/drivers/Makefile"
+          add_source "$K/drivers/Kconfig" 'source "drivers/kernelsu/Kconfig"'
+
+          grep -n nomount "$K/fs/Makefile" "$K/fs/Kconfig"
+          grep -n kernelsu "$K/drivers/Makefile" "$K/drivers/Kconfig"
+
+      - name: Check whether this KernelSU-Next already contains the official stable release
+        continue-on-error: true
+        run: |
+          set -eu
+          cd kernel/KernelSU-Next
+          git fetch -q https://github.com/KernelSU-Next/KernelSU-Next tag "$KSUN_STABLE_TAG"
+          TAGSHA="$(git rev-parse FETCH_HEAD^{commit})"
+          echo "official $KSUN_STABLE_TAG = $TAGSHA"
+          echo "kernel KSU-Next commit (dev-susfs) = $(git rev-parse HEAD)"
+          if git merge-base --is-ancestor "$TAGSHA" HEAD; then
+            echo "OK: this kernel includes the official $KSUN_STABLE_TAG release."
+          else
+            echo "NOTE: this kernel does NOT include official $KSUN_STABLE_TAG yet (pershoot has not synced it)."
+          fi
+
+      - name: Write in-container build script
+        run: |
+          cat > ci-build.sh <<'EOF'
+          #!/bin/bash
+          # Runs INSIDE the Debian container. /w = workspace, /clang = Android clang
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            flex bison bc cpio libssl-dev libelf-dev xz-utils python3 binutils \
+            make gcc g++ git ca-certificates curl python-is-python3 perl
+          head -2 /etc/os-release
+          # repo is owned by another uid than root: let git (used by Kbuild) work anyway
+          git config --global --add safe.directory '*'
+          export PATH=/clang/bin:$PATH
+          clang --version | sed -n 1p
+          cd /w/kernel
+          MK="ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ O=out LOCALVERSION="
+
+          mkdir -p out
+          cp ../config.txt out/.config
+          printf 'CONFIG_NOMOUNT=y\nCONFIG_KSU=y\nCONFIG_KSU_SUSFS=y\n' >> out/.config
+          # TCP BBR + Westwood (+ fq qdisc, which BBR works best with). Selectable at runtime; the default stays cubic.
+          printf 'CONFIG_TCP_CONG_ADVANCED=y\nCONFIG_TCP_CONG_BBR=y\nCONFIG_TCP_CONG_WESTWOOD=y\nCONFIG_NET_SCH_FQ=y\n' >> out/.config
+          # fq_codel + cake qdiscs, TTL/HL iptables target (hotspot TTL), WireGuard VPN
+          printf 'CONFIG_NET_SCH_FQ_CODEL=y\nCONFIG_NET_SCH_CAKE=y\nCONFIG_NETFILTER_XT_TARGET_HL=y\nCONFIG_WIREGUARD=y\n' >> out/.config
+          grep -rnE 'config KSU_[A-Z0-9_]*HOOK' /w/kernel/KernelSU-Next/kernel --include='Kconfig*' || true
+
+          # Optional: seccomp off (see DISABLE_SECCOMP in the workflow env)
+          if [ "${DISABLE_SECCOMP:-0}" = 1 ]; then
+            sed -i 's/^CONFIG_SECCOMP=y/# CONFIG_SECCOMP is not set/; s/^CONFIG_SECCOMP_FILTER=y/# CONFIG_SECCOMP_FILTER is not set/' out/.config
+          fi
+          # newer clang adds new warnings; do not let CONFIG_WERROR turn them into errors
+          sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
+          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-gki-gc3d1c3d93062"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
+          make $MK olddefconfig
+          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|NOMOUNT|KSU|KSU_SUSFS|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES|LOCALVERSION)=' out/.config
+          # These must survive olddefconfig, otherwise vendor modules will not load
+          grep -q '^CONFIG_NOMOUNT=y' out/.config
+          grep -q '^CONFIG_KSU=y' out/.config
+          grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+          grep -q '^CONFIG_TCP_CONG_BBR=y' out/.config
+          grep -q '^CONFIG_TCP_CONG_WESTWOOD=y' out/.config
+          grep -q '^CONFIG_NET_SCH_FQ=y' out/.config
+          grep -q '^CONFIG_NET_SCH_FQ_CODEL=y' out/.config
+          grep -q '^CONFIG_NET_SCH_CAKE=y' out/.config
+          grep -q '^CONFIG_NETFILTER_XT_TARGET_HL=y' out/.config
+          grep -q '^CONFIG_WIREGUARD=y' out/.config
+          grep -E '^CONFIG_KSU' out/.config
+          grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config
+          grep -q '^CONFIG_CFI_CLANG=y' out/.config
+          grep -E '^CONFIG_(SECCOMP|SECCOMP_FILTER)=' out/.config || true
+          if [ "${DISABLE_SECCOMP:-0}" = 1 ] && grep -q '^CONFIG_SECCOMP=y' out/.config; then echo "ERROR: CONFIG_SECCOMP is still on"; exit 1; fi
+          diff <(grep -E '^(CONFIG_|# CONFIG_)' ../config.txt | sort) <(grep -E '^(CONFIG_|# CONFIG_)' out/.config | sort) > ../config.diff || true
+          echo "--- config differences against the phone config:"
+          cat ../config.diff
+
+          if ! make -j"$(nproc)" $MK KBUILD_BUILD_USER=PsychoAvy KBUILD_BUILD_HOST=github Image > ../build.log 2>&1; then
+            echo "BUILD FAILED, errors:"
+            grep -nE 'error|Error' ../build.log | head -60 || true
+            echo "last 60 lines:"; tail -60 ../build.log
+            exit 1
+          fi
+          tail -5 ../build.log
+
+          cd out
+          rel="$(cat include/config/kernel.release)"
+          echo "kernel.release = $rel"
+          [ "$rel" = "$EXPECTED_RELEASE" ]
+          strings -n 8 arch/arm64/boot/Image | grep -m1 'Linux version 5.10'
+          strings arch/arm64/boot/Image | grep -qx "$EXPECTED_RELEASE SMP preempt mod_unload modversions aarch64"
+          echo "nomount symbols: $(grep -cE ' [tT] nm_' System.map)"
+          echo "ksu symbols: $(grep -ciE 'ksu' System.map)"
+          echo "susfs symbols: $(grep -ciE 'susfs' System.map)"
+          grep -E 'KernelSU-Next (version|tag)|Hook mode' ../../build.log || true
+          ls -la arch/arm64/boot/Image
+          EOF
+          chmod +x ci-build.sh
+
+      - name: Configure, build and verify (inside Debian container)
+        run: |
+          set -eux
+          docker run --rm \
+            -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
+            -e DISABLE_SECCOMP="$DISABLE_SECCOMP" \
+            -v "$PWD":/w \
+            -v "$HOME/clang":/clang:ro \
+            "$BUILD_IMAGE" bash /w/ci-build.sh
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -eux
+          test -f kernel/out/arch/arm64/boot/Image
+          git clone -q --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git .github README.md patch ramdisk
+          mkdir -p ramdisk patch
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 - POCO F5 (marble) GKI 5.10 kernel + NoMount + KernelSU-Next + SUSFS
+          properties() { '
+          kernel.string=marble 5.10.269 GKI | NoMount + KernelSU-Next + SUSFS | Android clang built
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=marble
+          device.name2=marblein
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          # GKI boot image (header v4): only the kernel is replaced, ramdisk untouched
+          split_boot;
+          flash_boot;
+          EOF
+          cp ../kernel/out/arch/arm64/boot/Image Image
+          zip -qr9 ../marble-nomount-ksun.zip .
+          cd ..
+          cp kernel/out/arch/arm64/boot/Image Image
+          sha256sum marble-nomount-ksun.zip Image | tee SHA256SUMS
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-kernel
+          if-no-files-found: warn
+          path: |
+            marble-nomount-ksun.zip
+            Image
+            SHA256SUMS
+            build.log
+            config.diff
+
+            
 
