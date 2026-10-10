@@ -39,6 +39,10 @@ env:
   CLANG_VER: ${{ inputs.clang_ver }}
   SUBLEVEL: ${{ inputs.sublevel }}
   CCACHE_DIR: /home/runner/.ccache
+  # 5.10 kbuild derives clang's --target from CROSS_COMPILE; without it clang targets x86 and
+  # asm with x0/x1 clobbers fails ("unknown register name 'x0' in asm")
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
   KBUILD_BUILD_USER: PsychoAvy
   KBUILD_BUILD_HOST: github
 
