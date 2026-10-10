@@ -207,7 +207,15 @@ jobs:
         working-directory: kernel
         run: |
           export PATH="$HOME/clang/bin:$PATH"
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc)" Image 2>&1 | tee build.log | tail -n 40
+          if ! make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" -j"$(nproc)" Image > build.log 2>&1; then
+            echo "::group::first errors in build.log"
+            grep -nE "error:|undefined (symbol|reference)|\*\*\*|Error [0-9]" build.log | head -60
+            echo "::endgroup::"
+            echo "::group::last 80 lines"; tail -n 80 build.log; echo "::endgroup::"
+            echo "::error::kernel build failed (see first errors above)"
+            exit 1
+          fi
+          tail -n 20 build.log
           test -f out/arch/arm64/boot/Image
           make -s O=out ARCH=arm64 LLVM=1 kernelrelease | tee ../kernelrelease.txt
           grep -a -m1 'Linux version' out/include/generated/compile.h out/include/generated/utsrelease.h 2>/dev/null || true
