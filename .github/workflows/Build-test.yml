@@ -27,6 +27,9 @@ on:
       sublevel:
         description: "5.10 sublevel to build"
         default: "271"
+      on_conflict:
+        description: "If the 271 stable delta conflicts with Google's tree: ours = keep Google's version of those files (skip their stable fixes), fail = stop"
+        default: "ours"
       lto:
         description: "LTO mode: thin | full | none (full = stock, slow and RAM hungry on GitHub runners)"
         default: "thin"
@@ -114,9 +117,14 @@ jobs:
             git diff --binary "v5.10.${BASE_N}" "v5.10.${SUBLEVEL}" > ../stable.patch
             wc -l ../stable.patch
             if ! git apply --3way --index ../stable.patch; then
-              echo "::error::stable delta conflicts with Google's tree:"
-              git diff --name-only --diff-filter=U
-              exit 1
+              git diff --name-only --diff-filter=U > ../conflicts.txt
+              echo "::warning::$(wc -l < ../conflicts.txt) file(s) conflict between stable delta and Google's tree:"
+              cat ../conflicts.txt
+              if [ "${{ inputs.on_conflict }}" = "fail" ]; then exit 1; fi
+              # keep Google's version of each conflicted file (their stable change is NOT applied)
+              xargs -a ../conflicts.txt git checkout --ours --
+              xargs -a ../conflicts.txt git add --
+              ! git diff --name-only --diff-filter=U | grep -q . || { echo "::error::unresolved files remain"; exit 1; }
             fi
             git commit -q -m "Merge 5.10.${SUBLEVEL} stable delta into Google 5.10.${BASE_N} (local)"
           fi
