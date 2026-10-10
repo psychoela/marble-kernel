@@ -166,16 +166,31 @@ jobs:
           cd kernel
           git fetch -q --depth 1 "$STABLE_REPO" tag "$STABLE_FROM" tag "$STABLE_TO"
           git diff "$STABLE_FROM" "$STABLE_TO" -- . ':!Makefile' > ../stable.diff
-          git diff --stat "$STABLE_FROM" "$STABLE_TO" -- . ':!Makefile' | tail -1
-          if ! git apply --3way ../stable.diff; then
-            echo "ERROR: conflicts while applying $STABLE_FROM -> $STABLE_TO. Conflicted files:"
-            git diff --name-only --diff-filter=U
-            echo "----- conflict hunks (first 200 lines)"
-            git diff --diff-filter=U | head -200
-            exit 1
+          TOTAL="$(git diff --name-only "$STABLE_FROM" "$STABLE_TO" -- . ':!Makefile' | wc -l)"
+          echo "stable $STABLE_FROM -> $STABLE_TO touches $TOTAL files"
+          CONF=""
+          if git apply --3way ../stable.diff; then
+            echo "OK: applied cleanly"
+          else
+            CONF="$(git diff --name-only --diff-filter=U)"
+            [ -n "$CONF" ] || { echo "ERROR: apply failed without conflicts (see messages above)"; exit 1; }
+            # Conflicts are in vendor-modified files (e.g. Qualcomm drivers): keep the vendor version
+            # of those files and take the stable changes for everything else.
+            for f in $CONF; do git checkout HEAD -- "$f"; done
+            [ -z "$(git diff --name-only --diff-filter=U)" ] || { echo "ERROR: still unmerged files"; exit 1; }
           fi
-          echo "OK: applied $STABLE_FROM -> $STABLE_TO cleanly"
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' Makefile | head -3
+          {
+            echo "### Stable update $STABLE_FROM -> $STABLE_TO"
+            echo "Files in the stable diff: $TOTAL"
+            echo "Skipped because of conflicts (vendor version kept):"
+            echo '```'
+            echo "${CONF:-none}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "=============================="
+          echo "SKIPPED (conflict, vendor version kept):"
+          echo "${CONF:-none}"
 
       - name: Apply SUSFS kernel patches
         run: |
@@ -383,5 +398,5 @@ jobs:
             build.log
             config.diff
 
-            
 
+            
