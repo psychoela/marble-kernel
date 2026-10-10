@@ -230,6 +230,10 @@ jobs:
           mkdir -p out
           cp ../config.txt out/.config
           printf 'CONFIG_NOMOUNT=y\nCONFIG_KSU=y\nCONFIG_KSU_SUSFS=y\n' >> out/.config
+          # TCP BBR + Westwood (+ fq qdisc, which BBR works best with). Selectable at runtime; the default stays cubic.
+          printf 'CONFIG_TCP_CONG_ADVANCED=y\nCONFIG_TCP_CONG_BBR=y\nCONFIG_TCP_CONG_WESTWOOD=y\nCONFIG_NET_SCH_FQ=y\n' >> out/.config
+          # fq_codel + cake qdiscs, TTL/HL iptables target (hotspot TTL), WireGuard VPN
+          printf 'CONFIG_NET_SCH_FQ_CODEL=y\nCONFIG_NET_SCH_CAKE=y\nCONFIG_NETFILTER_XT_TARGET_HL=y\nCONFIG_WIREGUARD=y\n' >> out/.config
           grep -rnE 'config KSU_[A-Z0-9_]*HOOK' /w/kernel/KernelSU-Next/kernel --include='Kconfig*' || true
 
           # Optional: seccomp off (see DISABLE_SECCOMP in the workflow env)
@@ -240,11 +244,18 @@ jobs:
           sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
           sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-gki-gc3d1c3d93062"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
           make $MK olddefconfig
-          grep -E '^CONFIG_(NOMOUNT|KSU|KSU_SUSFS|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES|LOCALVERSION)=' out/.config
+          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|NOMOUNT|KSU|KSU_SUSFS|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|KPROBES|LOCALVERSION)=' out/.config
           # These must survive olddefconfig, otherwise vendor modules will not load
           grep -q '^CONFIG_NOMOUNT=y' out/.config
           grep -q '^CONFIG_KSU=y' out/.config
           grep -q '^CONFIG_KSU_SUSFS=y' out/.config
+          grep -q '^CONFIG_TCP_CONG_BBR=y' out/.config
+          grep -q '^CONFIG_TCP_CONG_WESTWOOD=y' out/.config
+          grep -q '^CONFIG_NET_SCH_FQ=y' out/.config
+          grep -q '^CONFIG_NET_SCH_FQ_CODEL=y' out/.config
+          grep -q '^CONFIG_NET_SCH_CAKE=y' out/.config
+          grep -q '^CONFIG_NETFILTER_XT_TARGET_HL=y' out/.config
+          grep -q '^CONFIG_WIREGUARD=y' out/.config
           grep -E '^CONFIG_KSU' out/.config
           grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config
           grep -q '^CONFIG_CFI_CLANG=y' out/.config
