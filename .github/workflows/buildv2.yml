@@ -9,11 +9,11 @@ env:
   NOMOUNT_REPO: https://github.com/maxsteeel/nomount
   NOMOUNT_SHA: 7e7342cd48841cfedd00be2fd20a0311f69c48c5
   # Official KernelSU-Next (no SUSFS). The commit used is printed in the log.
-  # 24b9fdf = the dev commit whose manager CI build you wanted to match.
-  # Set KSUN_SHA to "" to use the branch tip instead.
+  # KSUN_SHA "" = tip of KSUN_BRANCH. To pin, use a commit that exists on that branch
+  # (a short SHA is fine). 24b9fdf was tried and is NOT in KernelSU-Next/KernelSU-Next dev.
   KSUN_REPO: https://github.com/KernelSU-Next/KernelSU-Next
   KSUN_BRANCH: dev
-  KSUN_SHA: "24b9fdf"
+  KSUN_SHA: ""
   # Official stable release to compare against (only used for a check printed in the log).
   KSUN_STABLE_TAG: v3.4.1
   # Android clang to use. Change these two lines to try another toolchain.
@@ -407,7 +407,7 @@ jobs:
             -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
             -e DISABLE_SECCOMP="$DISABLE_SECCOMP" \
             -e UNAME_FAKE_VERSION="$UNAME_FAKE_VERSION" \
-            -v "$PWD"
+            -v "$PWD":/w \
             -v "$HOME/clang":/clang:ro \
             "$BUILD_IMAGE" bash /w/ci-build.sh
 
@@ -467,4 +467,3 @@ jobs:
             SHA256SUMS
             build.log
             config.diff
-            
