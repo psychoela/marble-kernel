@@ -27,7 +27,7 @@ env:
   # Boot-critical Android daemons (bpfloader, netd, init, vintf, system_server, modprobe,
   # ueventd, clatd) are still shown the real version, because they pick features by kernel version.
   # Set to "" to turn this off completely (try that first if you ever bootloop).
-  UNAME_FAKE_VERSION: ""
+  UNAME_FAKE_VERSION: "6.12.112"
   # Turn off seccomp in the whole kernel (CONFIG_SECCOMP + CONFIG_SECCOMP_FILTER).
   # WARNING: this very likely breaks boot. It changes struct task_struct, so the
   # vendor modules fail the modversions check, and Android's zygote expects seccomp.
