@@ -44,6 +44,12 @@ env:
   # This kernel's real release is 5.10.269-gki-gc3d1c3d93062 (no "android12"), so we add a pattern
   # for it. Which .ko to use: android12-5.10 or android13-5.10 (the KMI of your stock kernel).
   SUSFS_LKM_KMI: android12-5.10
+  # Add a status marker and a status log to the SUSFS LKM module ("1" = on, "0" = off):
+  #  - the module description in the manager starts with [✅ SUSFS active, <kmi>] (or ❌ / ⚠️)
+  #  - /data/adb/susfs_lkm_loader/status.log lists what is loaded and active
+  #  - /data/adb/susfs_lkm_loader/options.conf (created on the phone) turns each one on/off later
+  #  - the module's Action button refreshes both and prints the status
+  SUSFS_LKM_STATUS: "1"
 
 jobs:
   build:
@@ -69,7 +75,7 @@ jobs:
 
       # Must run BEFORE "Free disk space": that step deletes /usr/local/lib/android (the Android NDK),
       # and the module build needs the NDK to compile its small probe binary.
-      - name: Build SUSFS LKM module ZIP (host, uses Android NDK)
+      - name: Fetch SUSFS LKM module and patch kmi.sh
         if: env.ENABLE_SUSFS_LKM == '1'
         continue-on-error: true
         run: |
@@ -86,6 +92,182 @@ jobs:
           sh -n module/kmi.sh
           cat module/kmi.sh
 
+      - name: Add status marker and status log to the SUSFS LKM module
+        if: env.ENABLE_SUSFS_LKM == '1' && env.SUSFS_LKM_STATUS == '1'
+        continue-on-error: true
+        run: |
+          set -eux
+          cd susfs-lkm-module
+          for f in status.sh service.sh action.sh; do
+            [ ! -e "module/$f" ] || { echo "ERROR: module/$f already exists upstream, not overwriting"; exit 1; }
+          done
+          cat > module/status.sh <<'STATUS_EOF'
+          #!/system/bin/sh
+          # SPDX-License-Identifier: GPL-2.0-only
+          # Status marker + status log for the SUSFS LKM loader. Sourced by service.sh and action.sh.
+          # Read-only: it never loads, unloads or changes SUSFS rules.
+          MODDIR=${MODDIR:-${0%/*}}
+          DATA=${SUSFS_LKM_DATA:-/data/adb/susfs_lkm_loader}
+          CONF=$DATA/options.conf
+          LOG=$DATA/status.log
+          PROP=$MODDIR/module.prop
+
+          susfs_load_options() {
+            STATUS_MARKER=1
+            STATUS_LOG=1
+            mkdir -p "$DATA" 2>/dev/null
+            if [ ! -f "$CONF" ]; then
+              cat > "$CONF" <<'OPT'
+          # SUSFS LKM Loader options. 1 = on, 0 = off.
+          # Applied at boot and when you press the Action button of this module.
+          # Put a check mark in front of the module description in the manager.
+          STATUS_MARKER=1
+          # Write /data/adb/susfs_lkm_loader/status.log (what is loaded and active).
+          STATUS_LOG=1
+          OPT
+            fi
+            . "$CONF"
+          }
+
+          susfs_state() {
+            LOADED=0
+            [ -d /sys/module/susfs_guard_lkm ] && LOADED=1
+            "$MODDIR/bin/susfs_probe" >/dev/null 2>&1
+            PROBE=$?
+            if [ "$LOADED" = 1 ] && [ "$PROBE" = 0 ]; then
+              MARK="✅"; TEXT="SUSFS active"
+            elif [ "$PROBE" = 0 ]; then
+              MARK="✅"; TEXT="SUSFS active (not from this loader)"
+            elif [ "$LOADED" = 1 ]; then
+              MARK="⚠️"; TEXT="LKM loaded but SUSFS not answering"
+            else
+              MARK="❌"; TEXT="SUSFS not loaded"
+            fi
+          }
+
+          susfs_write_log() {
+            {
+              echo "SUSFS LKM Loader status"
+              echo "time: $(date)"
+              echo "state: $MARK $TEXT"
+              echo "kernel: $(cat /proc/sys/kernel/osrelease 2>/dev/null)"
+              echo "kmi: $KMI"
+              echo "module version: $(sed -n 's/^version=//p' "$PROP" | head -1)"
+              echo "lkm loaded: $LOADED   probe rc: $PROBE (0 = SUSFS interface answers)"
+              echo
+              echo "== /sys/module/susfs_guard_lkm/parameters"
+              if [ -d /sys/module/susfs_guard_lkm/parameters ]; then
+                for p in /sys/module/susfs_guard_lkm/parameters/*; do
+                  [ -f "$p" ] && echo "${p##*/} = $(cat "$p" 2>/dev/null)"
+                done
+              else
+                echo "(none)"
+              fi
+              echo
+              echo "== /proc/susfs* control nodes (features that are active)"
+              found=0
+              for n in /proc/susfs*; do
+                [ -e "$n" ] || continue
+                found=1
+                echo "$n"
+              done
+              [ "$found" = 0 ] && echo "(none; the nodes exist only while the LKM runs with expose_proc=1)"
+              echo
+              if [ -r /proc/susfs_hide_mounts ]; then
+                echo "== /proc/susfs_hide_mounts (hidden mount prefixes)"
+                cat /proc/susfs_hide_mounts 2>&1
+                echo
+              fi
+              echo "== ksu_susfs"
+              KS=$(command -v ksu_susfs 2>/dev/null)
+              [ -x "$KS" ] || KS=/data/adb/ksu/bin/ksu_susfs
+              T=""
+              command -v timeout >/dev/null 2>&1 && T="timeout 5"
+              if [ -x "$KS" ]; then
+                for a in "show version" "show variant" "show enabled_features"; do
+                  echo "\$ ksu_susfs $a"
+                  $T "$KS" $a 2>&1
+                  echo
+                done
+              else
+                echo "(ksu_susfs binary not found; rules are managed by FolkSU or another tool)"
+              fi
+              echo "== load.log (written at boot by post-fs-data.sh)"
+              cat "$MODDIR/load.log" 2>/dev/null
+            } > "$LOG" 2>&1
+          }
+
+          susfs_update_prop() {
+            [ -f "$PROP" ] || return 0
+            desc=$(sed -n 's/^description=//p' "$PROP" | head -1)
+            desc=$(printf '%s' "$desc" | sed 's/^\[[^]]*\] *//')
+            if [ "$STATUS_MARKER" = 1 ]; then
+              desc="[$MARK $TEXT, $KMI] $desc"
+            fi
+            { grep -v '^description=' "$PROP"; printf 'description=%s\n' "$desc"; } > "$PROP.tmp" \
+              && cat "$PROP.tmp" > "$PROP"
+            rm -f "$PROP.tmp"
+          }
+
+          susfs_status_update() {
+            susfs_load_options
+            KMI=$(. "$MODDIR/kmi.sh" 2>/dev/null && select_kmi "$(cat /proc/sys/kernel/osrelease)") || KMI=unknown
+            susfs_state
+            if [ "$STATUS_LOG" = 1 ]; then
+              susfs_write_log
+            else
+              rm -f "$LOG"
+            fi
+            susfs_update_prop
+          }
+          STATUS_EOF
+          cat > module/service.sh <<'SERVICE_EOF'
+          #!/system/bin/sh
+          # SPDX-License-Identifier: GPL-2.0-only
+          MODDIR=${0%/*}
+          [ ! -f "$MODDIR/disable" ] && [ ! -f "$MODDIR/remove" ] || exit 0
+          . "$MODDIR/status.sh"
+          i=0
+          while [ "$(getprop sys.boot_completed)" != 1 ] && [ "$i" -lt 90 ]; do
+            sleep 2
+            i=$((i + 1))
+          done
+          susfs_status_update
+          SERVICE_EOF
+          cat > module/action.sh <<'ACTION_EOF'
+          #!/system/bin/sh
+          # SPDX-License-Identifier: GPL-2.0-only
+          MODDIR=${0%/*}
+          . "$MODDIR/status.sh"
+          susfs_status_update
+          echo "$MARK $TEXT"
+          echo "KMI: $KMI"
+          echo
+          if [ "$STATUS_LOG" = 1 ]; then
+            sed -n '1,40p' "$LOG"
+          else
+            echo "Status log is off (STATUS_LOG=0)."
+          fi
+          echo
+          echo "Options: $CONF"
+          echo "Full log: $LOG"
+          ACTION_EOF
+          printf '\n' >> module/customize.sh
+          cat >> module/customize.sh <<'CUST_EOF'
+          set_perm "$MODPATH/status.sh" 0 0 0755
+          set_perm "$MODPATH/service.sh" 0 0 0755
+          set_perm "$MODPATH/action.sh" 0 0 0755
+          ui_print "- Status marker + status log: /data/adb/susfs_lkm_loader/ (options.conf, status.log)"
+          CUST_EOF
+          for f in status.sh service.sh action.sh customize.sh; do sh -n "module/$f"; done
+          tail -6 module/customize.sh
+
+      - name: Build SUSFS LKM module ZIP (host, uses Android NDK)
+        if: env.ENABLE_SUSFS_LKM == '1'
+        continue-on-error: true
+        run: |
+          set -eux
+          cd susfs-lkm-module
           export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
           test -d "$ANDROID_NDK_HOME" || { echo "ERROR: Android NDK not found on the runner"; exit 1; }
           echo "NDK: $ANDROID_NDK_HOME"
@@ -94,6 +276,8 @@ jobs:
           cp dist/susfs-lkm-module-*.zip "$GITHUB_WORKSPACE/susfs-lkm-module.zip"
           unzip -l "$GITHUB_WORKSPACE/susfs-lkm-module.zip" | grep -E 'kmi.sh|\.ko|susfs_insmod'
           unzip -p "$GITHUB_WORKSPACE/susfs-lkm-module.zip" kmi.sh | grep -q -- '-gki-'
+          if [ "$SUSFS_LKM_STATUS" = 1 ]; then unzip -l "$GITHUB_WORKSPACE/susfs-lkm-module.zip" | grep -E 'status.sh|service.sh|action.sh'; fi
+
 
       - name: Free disk space and add swap (host)
         run: |
