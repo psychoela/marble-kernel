@@ -1,4 +1,4 @@
-name: Build marble kernel (NoMount + KernelSU-Next + SUSFS LKM module, shows as 6.12.25, Android clang 21 (r563880c), Debian container)
+name: Build marble kernel (NoMount + KernelSU-Next + SUSFS LKM module, real uname, Android clang 21 (r563880c), Debian container)
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ env:
   # Boot-critical Android daemons (bpfloader, netd, init, vintf, system_server, modprobe,
   # ueventd, clatd) are still shown the real version, because they pick features by kernel version.
   # Set to "" to turn this off completely (try that first if you ever bootloop).
-  UNAME_FAKE_VERSION: "6.12.25"
+  UNAME_FAKE_VERSION: ""
   # Turn off seccomp in the whole kernel (CONFIG_SECCOMP + CONFIG_SECCOMP_FILTER).
   # WARNING: this very likely breaks boot. It changes struct task_struct, so the
   # vendor modules fail the modversions check, and Android's zygote expects seccomp.
@@ -215,6 +215,30 @@ jobs:
 
           grep -n nomount "$K/fs/Makefile" "$K/fs/Kconfig"
           grep -n kernelsu "$K/drivers/Makefile" "$K/drivers/Kconfig"
+
+      - name: Provide __stack_chk_guard for the SUSFS LKM
+        if: env.ENABLE_SUSFS_LKM == '1'
+        run: |
+          set -eux
+          K="$PWD/kernel"
+          # This kernel uses CONFIG_STACKPROTECTOR_PER_TASK, so it has no global __stack_chk_guard.
+          # The prebuilt susfs_guard_lkm-*.ko still references it (load.log: "unresolved
+          # __stack_chk_guard", init_module ENOENT). A plain global variable fixes that. It adds one
+          # symbol only: no struct or existing symbol changes, so vendor modules are unaffected.
+          cat > "$K/kernel/susfs_lkm_support.c" <<'CEOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * Global stack protector guard for prebuilt LKMs that were compiled with the global
+           * guard model. The kernel itself keeps using its per-task canary and never reads this.
+           */
+          #include <linux/compiler.h>
+          #include <linux/export.h>
+
+          unsigned long __stack_chk_guard __used = 0x5f5ec0de5f5ec0deUL;
+          EXPORT_SYMBOL(__stack_chk_guard);
+          CEOF
+          grep -q 'susfs_lkm_support' "$K/kernel/Makefile" || printf '\nobj-y += susfs_lkm_support.o\n' >> "$K/kernel/Makefile"
+          tail -3 "$K/kernel/Makefile"
 
       - name: Show the fake version in uname (display only)
         if: env.UNAME_FAKE_VERSION != ''
@@ -404,16 +428,6 @@ jobs:
           sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
           sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-gki-gc3d1c3d93062"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
           make $MK olddefconfig
-          grep -rnE 'config KSU_[A-Z0-9_]*HOOK' /w/kernel/KernelSU-Next/kernel --include='Kconfig*' || true
-
-          # Optional: seccomp off (see DISABLE_SECCOMP in the workflow env)
-          if [ "${DISABLE_SECCOMP:-0}" = 1 ]; then
-            sed -i 's/^CONFIG_SECCOMP=y/# CONFIG_SECCOMP is not set/; s/^CONFIG_SECCOMP_FILTER=y/# CONFIG_SECCOMP_FILTER is not set/' out/.config
-          fi
-          # newer clang adds new warnings; do not let CONFIG_WERROR turn them into errors
-          sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
-          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-gki-gc3d1c3d93062"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
-          make $MK olddefconfig
           grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|NOMOUNT|KSU|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|KALLSYMS|KALLSYMS_ALL|KPROBES|LOCALVERSION)=' out/.config
           # These must survive olddefconfig, otherwise vendor modules will not load
           grep -q '^CONFIG_NOMOUNT=y' out/.config
@@ -456,6 +470,9 @@ jobs:
           fi
           echo "nomount symbols: $(grep -cE ' [tT] nm_' System.map)"
           echo "ksu symbols: $(grep -ciE 'ksu' System.map)"
+          if [ "${ENABLE_SUSFS_LKM:-0}" = 1 ]; then
+            grep -E ' [A-Za-z] __stack_chk_guard$' System.map || echo "WARNING: __stack_chk_guard is not in System.map, the SUSFS LKM will fail to load"
+          fi
           echo "susfs symbols (informational, 0 is expected: SUSFS comes from the LKM module): $(grep -ciE 'susfs' System.map)"
           grep -E 'KernelSU-Next (version|tag)|Hook mode' ../../build.log || true
           ls -la arch/arm64/boot/Image
@@ -469,6 +486,7 @@ jobs:
             -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
             -e DISABLE_SECCOMP="$DISABLE_SECCOMP" \
             -e UNAME_FAKE_VERSION="$UNAME_FAKE_VERSION" \
+            -e ENABLE_SUSFS_LKM="$ENABLE_SUSFS_LKM" \
             -v "$PWD":/w \
             -v "$HOME/clang":/clang:ro \
             "$BUILD_IMAGE" bash /w/ci-build.sh
@@ -484,7 +502,7 @@ jobs:
           cat > anykernel.sh <<'EOF'
           ### AnyKernel3 - POCO F5 (marble) GKI 5.10 kernel + NoMount + KernelSU-Next
           properties() { '
-          kernel.string=marble 5.10.269 GKI (shown as 6.12.25) | NoMount + KernelSU-Next | Android clang built
+          kernel.string=marble 5.10.269 GKI | NoMount + KernelSU-Next | Android clang built
           do.devicecheck=1
           do.modules=0
           do.systemless=1
