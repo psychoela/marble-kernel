@@ -414,6 +414,11 @@ jobs:
             fi
           }
 
+          # The fork may already contain leftovers (a file/symlink named fs/nomount made
+          # "mkdir -p" fail with "File exists"). Show what is there, then start clean.
+          ls -ld "$K/fs/nomount" "$K/drivers/kernelsu" "$K/KernelSU-Next" 2>&1 || true
+         rm -rf "$K/fs/nomount" "$K/drivers/kernelsu" "$K/KernelSU-Next"
+
           # NoMount: copy source into fs/nomount
           mkdir -p "$K/fs/nomount"
           cp -f nomount/kernel/src/* "$K/fs/nomount/"
