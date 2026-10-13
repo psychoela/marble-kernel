@@ -282,14 +282,31 @@ jobs:
       - name: Free disk space and add swap (host)
         run: |
           set -eux
+          # Full LTO + CFI link of vmlinux.o needs far more than the runner's ~7 GB RAM
+          # (previous run: "Killed" / Error 137 = OOM). Free as much disk as possible and
+          # turn it into a big swap file.
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/.ghcup /usr/share/swift /usr/local/share/boost /usr/lib/jvm \
+            /usr/local/julia* /usr/local/share/chromium /opt/microsoft /usr/lib/google-cloud-sdk \
+            /usr/share/miniconda /opt/az /usr/local/aws-cli /usr/local/share/powershell || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
           sudo swapoff -a || true
-          sudo fallocate -l 12G /mnt/swapfile
+          sudo rm -f /mnt/swapfile /swapfile || true
+          AVAIL_G="$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9')"
+          # keep ~22 GB for clang, kernel tree and out/, rest goes to swap (8..40 GB)
+          SWAP_G=$(( AVAIL_G - 22 ))
+          [ "$SWAP_G" -gt 40 ] && SWAP_G=40
+          [ "$SWAP_G" -lt 8 ] && SWAP_G=8
+          echo "available ${AVAIL_G}G -> swap ${SWAP_G}G"
+          sudo fallocate -l "${SWAP_G}G" /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
+          sudo sysctl vm.swappiness=100 || true
           df -h / /mnt
           free -g
+          nproc
 
       - name: Download Android clang
         run: |
@@ -612,7 +629,7 @@ jobs:
           sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
           sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-gki-gc3d1c3d93062"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
           make $MK olddefconfig
-          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|NOMOUNT|KSU|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|KALLSYMS|KALLSYMS_ALL|KPROBES|LOCALVERSION)=' out/.config
+          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|NOMOUNT|KSU|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|KALLSYMS|KALLSYMS_ALL|KPROBES|LOCALVERSION|DEBUG_INFO|DEBUG_INFO_BTF)=' out/.config || true
           # These must survive olddefconfig, otherwise vendor modules will not load
           grep -q '^CONFIG_NOMOUNT=y' out/.config
           grep -q '^CONFIG_KSU=y' out/.config
@@ -633,12 +650,16 @@ jobs:
           echo "--- config differences against the phone config:"
           cat ../config.diff
 
+          # memory monitor (shows in the log how close the LTO link gets to the limit)
+          ( while sleep 120; do echo "[mem] $(free -m | awk 'NR==2{print "ram used "$3"/"$2" MB"} NR==3{print "swap used "$3"/"$2" MB"}' | tr '\n' ' ')"; done ) &
+          MONPID=$!
           if ! make -j"$(nproc)" $MK KBUILD_BUILD_USER=PsychoAvy KBUILD_BUILD_HOST=github Image > ../build.log 2>&1; then
             echo "BUILD FAILED, errors:"
             grep -nE 'error|Error' ../build.log | head -60 || true
             echo "last 60 lines:"; tail -60 ../build.log
             exit 1
           fi
+          kill $MONPID 2>/dev/null || true
           tail -5 ../build.log
 
           cd out
