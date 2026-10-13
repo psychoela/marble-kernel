@@ -1,4 +1,4 @@
-name: Build marble kernel (NoMount + KernelSU-Next, Android clang 21 (r563880c), Debian container)
+name: Build marble kernel (NoMount + KernelSU-Next, SUSFS via KernelSU-Next's own LKM, Android clang 21 (r563880c), Debian container)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,11 @@ env:
   KERNEL_SHA: c3d1c3d93062911060e8460fdb88cab235f6603e
   NOMOUNT_REPO: https://github.com/maxsteeel/nomount
   NOMOUNT_SHA: 7e7342cd48841cfedd00be2fd20a0311f69c48c5
-  # KernelSU-Next (pershoot's dev-susfs branch). Its in-kernel SUSFS stays OFF (no SUSFS in this build).
+  # KernelSU-Next (pershoot's dev-susfs branch). Its in-kernel SUSFS stays OFF in this build.
+  # SUSFS comes from KernelSU-Next's OWN loadable module (susfs_guard_lkm.ko, source in kernel/susfs): it is built by
+  # KernelSU-Next's CI and bundled inside ksud / the manager, per KMI (here android12-5.10). Nothing extra is built or
+  # packaged here. On the phone: `ksud susfs load` once, or `ksud susfs autoload enable` for loading at boot.
+  # It refuses to load (-EEXIST) if SUSFS is built into the kernel, so the checks below keep it out.
   # KSUN_SHA empty = branch tip. The commit used is printed in the log: paste it here to pin it.
   KSUN_REPO: https://github.com/pershoot/KernelSU-Next
   KSUN_BRANCH: dev-susfs
@@ -48,12 +52,31 @@ jobs:
       - name: Free disk space and add swap (host)
         run: |
           set -eux
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          # The full-LTO link of vmlinux.o needs far more than the 16 GB RAM of the runner (a previous run was killed
+          # there, "Error 137"). So: free as much disk as possible, then put big swap files on / and /mnt.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift /usr/local/share/boost /opt/microsoft /opt/az /usr/local/.ghcup \
+            /usr/local/share/powershell /usr/lib/jvm /usr/lib/google-cloud-sdk /usr/lib/firefox || true
+          sudo docker image prune -af || true
+          sudo apt-get clean || true
           sudo swapoff -a || true
+          df -h / /mnt
           sudo fallocate -l 12G /mnt/swapfile
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
+          # second swap file on / (leave >= 15 GB free for the kernel tree, out/, clang and the zip)
+          AVAIL_G="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+          SWAP2_G=$(( AVAIL_G - 18 ))
+          if [ "$SWAP2_G" -gt 20 ]; then SWAP2_G=20; fi
+          if [ "$SWAP2_G" -ge 4 ]; then
+            sudo fallocate -l "${SWAP2_G}G" /swapfile2
+            sudo chmod 600 /swapfile2
+            sudo mkswap /swapfile2
+            sudo swapon /swapfile2
+          fi
+          sudo sysctl -w vm.swappiness=100 || true
+          swapon --show
           df -h / /mnt
           free -g
 
@@ -180,6 +203,22 @@ jobs:
             echo "NOTE: this kernel does NOT include official $KSUN_STABLE_TAG yet (pershoot has not synced it)."
           fi
 
+      - name: Check that this KernelSU-Next has the SUSFS LKM (info only)
+        continue-on-error: true
+        run: |
+          set -u
+          cd kernel/KernelSU-Next
+          echo "commit: $(git rev-parse HEAD)"
+          for f in kernel/susfs/susfs_main.c kernel/susfs/Makefile userspace/ksud/src/susfsd.rs; do
+            if [ -f "$f" ]; then echo "OK: $f present"; else echo "NOTE: $f missing (this KernelSU-Next has no SUSFS LKM; use a newer manager/ksud and branch)"; fi
+          done
+          if grep -q 'susfs_is_inode_sus_path' kernel/susfs/susfs_main.c 2>/dev/null; then
+            echo "OK: LKM refuses to load when SUSFS is built into the kernel (dead man's switch)"
+          else
+            echo "NOTE: no dead man's switch in this LKM version"
+          fi
+          echo "NOTE: the .ko is bundled in the manager/ksud you install (assets <KMI>_susfs_guard_lkm.ko), not in this kernel zip."
+
       - name: Write in-container build script
         run: |
           cat > ci-build.sh <<'EOF'
@@ -220,8 +259,12 @@ jobs:
           # These must survive olddefconfig, otherwise vendor modules will not load
           grep -q '^CONFIG_NOMOUNT=y' out/.config
           grep -q '^CONFIG_KSU=y' out/.config
-          # No SUSFS in this build: the kernel is not SUSFS-patched, so it must stay off
-          if grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then echo "ERROR: CONFIG_KSU_SUSFS is on, but the kernel is not SUSFS-patched"; exit 1; fi
+          # SUSFS is loaded as KernelSU-Next's LKM, so built-in SUSFS must stay off: the kernel is not SUSFS-patched,
+          # and the LKM refuses to load next to a built-in SUSFS.
+          if grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then echo "ERROR: CONFIG_KSU_SUSFS is on, but the kernel is not SUSFS-patched (SUSFS is loaded as an LKM)"; exit 1; fi
+          # The SUSFS LKM needs module loading support
+          grep -q '^CONFIG_MODULES=y' out/.config
+          grep -q '^CONFIG_MODULE_UNLOAD=y' out/.config
           grep -q '^CONFIG_TCP_CONG_BBR=y' out/.config
           grep -q '^CONFIG_TCP_CONG_WESTWOOD=y' out/.config
           grep -q '^CONFIG_NET_SCH_FQ=y' out/.config
@@ -254,7 +297,9 @@ jobs:
           strings arch/arm64/boot/Image | grep -qx "$EXPECTED_RELEASE SMP preempt mod_unload modversions aarch64"
           echo "nomount symbols: $(grep -cE ' [tT] nm_' System.map)"
           echo "ksu symbols: $(grep -ciE 'ksu' System.map)"
-          if grep -qiE 'susfs' System.map; then echo "WARNING: unexpected susfs symbols in the kernel"; fi
+          if grep -qiE 'susfs' System.map; then echo "WARNING: unexpected susfs symbols in the kernel"; grep -iE 'susfs' System.map | head -20; fi
+          # The LKM looks up these two symbols and refuses to load if either exists
+          if grep -qE ' (susfs_is_inode_sus_path|susfs_sus_kstat_spoof_generic_fillattr)$' System.map; then echo "ERROR: SUSFS is built into the kernel, the SUSFS LKM would refuse to load"; exit 1; fi
           grep -E 'KernelSU-Next (version|tag)|Hook mode' ../../build.log || true
           ls -la arch/arm64/boot/Image
           EOF
@@ -263,6 +308,10 @@ jobs:
       - name: Configure, build and verify (inside Debian container)
         run: |
           set -eux
+          # Log memory use every minute, so the log shows the peak of the LTO link
+          ( while sleep 60; do echo "[mem] $(date +%T) $(free -m | awk '/^Mem:/{print "ram_used="$3"M"} /^Swap:/{print "swap_used="$3"M"}' | tr '\n' ' ')"; done ) &
+          MON=$!
+          trap 'kill $MON 2>/dev/null || true; sudo dmesg 2>/dev/null | grep -iE "out of memory|killed process" | tail -5 || true' EXIT
           docker run --rm \
             -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
             -e DISABLE_SECCOMP="$DISABLE_SECCOMP" \
@@ -281,7 +330,7 @@ jobs:
           cat > anykernel.sh <<'EOF'
           ### AnyKernel3 - POCO F5 (marble) GKI 5.10 kernel + NoMount + KernelSU-Next
           properties() { '
-          kernel.string=marble 5.10.269 GKI | NoMount + KernelSU-Next | Android clang built
+          kernel.string=marble 5.10.269 GKI | NoMount + KernelSU-Next (SUSFS LKM ready) | Android clang built
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -326,4 +375,5 @@ jobs:
             SHA256SUMS
             build.log
             config.diff
+
             
