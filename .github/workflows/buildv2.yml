@@ -1,11 +1,14 @@
-name: Build marble kernel (NoMount + KernelSU-Next + SUSFS LKM module, real uname, Android clang 21 (r563880c), Debian container)
+name: Build marble kernel from psychoela/marble-kernel-x (NoMount + KernelSU-Next + SUSFS LKM module, real uname, Android clang 21 (r563880c), Debian container)
 
 on:
   workflow_dispatch:
 
 env:
-  KERNEL_REPO: https://github.com/Evolution-X-Devices/kernel_xiaomi_sm8450
-  KERNEL_SHA: c3d1c3d93062911060e8460fdb88cab235f6603e
+  # Your own kernel source (fork of Evolution-X kernel_xiaomi_sm8450, branch cnb, 5.10.269).
+  # KERNEL_SHA "" = tip of KERNEL_BRANCH (the commit is printed in the log). To pin, put a commit SHA here.
+  KERNEL_REPO: https://github.com/psychoela/marble-kernel-x
+  KERNEL_BRANCH: cnb
+  KERNEL_SHA: ""
   NOMOUNT_REPO: https://github.com/maxsteeel/nomount
   NOMOUNT_SHA: 7e7342cd48841cfedd00be2fd20a0311f69c48c5
   # Official KernelSU-Next (no SUSFS). The commit used is printed in the log.
@@ -85,12 +88,26 @@ jobs:
           git -C susfs-lkm-module log -1 --format='susfs-lkm-module %H %s'
           cd susfs-lkm-module
 
-          # kmi.sh only knows "-androidNN-" releases. Add this kernel's "-gki-" release.
-          grep -n "5.10" module/kmi.sh
-          sed -i "s|^\(  *\)5\.10\.\*-android12-\*) echo android12-5.10 ;;|&\n\15.10.*-gki-*) echo $SUSFS_LKM_KMI ;;|" module/kmi.sh
+          # Upstream kmi.sh changed format (the old "5.10.*-android12-*)" case line is gone), so a
+          # sed on one line no longer works. Instead: rename the upstream select_kmi() and put a
+          # small wrapper in front of it that maps this kernel's "-gki-" release to $SUSFS_LKM_KMI.
+          echo "---- upstream kmi.sh ----"; cat module/kmi.sh; echo "---- end ----"
+          grep -qE '^select_kmi[[:space:]]*\(\)' module/kmi.sh || { echo "ERROR: select_kmi() not found in module/kmi.sh (see the file printed above)"; exit 1; }
+          sed -i -E 's/^select_kmi[[:space:]]*\(\)/select_kmi_upstream()/' module/kmi.sh
+          printf '\n' >> module/kmi.sh
+          cat >> module/kmi.sh <<KMI_EOF
+          select_kmi() {
+            case "\$1" in
+              5.10.*-gki-*) echo "$SUSFS_LKM_KMI"; return 0 ;;
+            esac
+            select_kmi_upstream "\$@"
+          }
+          KMI_EOF
           grep -q -- '5.10.\*-gki-\*)' module/kmi.sh || { echo "ERROR: could not patch module/kmi.sh"; exit 1; }
           sh -n module/kmi.sh
-          cat module/kmi.sh
+          # quick self-test of the wrapper
+          sh -c '. ./module/kmi.sh && test "$(select_kmi 5.10.269-gki-gc3d1c3d93062)" = "$SUSFS_LKM_KMI"' || { echo "ERROR: select_kmi self-test failed"; exit 1; }
+          tail -12 module/kmi.sh
 
       - name: Add status marker and status log to the SUSFS LKM module
         if: env.ENABLE_SUSFS_LKM == '1' && env.SUSFS_LKM_STATUS == '1'
@@ -314,52 +331,46 @@ jobs:
           cat > fetch-clang.sh <<'EOF'
           #!/bin/bash
           # usage: fetch-clang.sh <repo-url> <clang-dir> <dest>
-          # Finds <clang-dir> in the Android prebuilts repo: current branch tips first, then history.
+          # clang-r563880c is no longer on any branch tip. Find the last commit that still had it
+          # (history of main-kernel, metadata only, a few seconds) and download ONLY that directory
+          # as a tar.gz from Gitiles (+archive). This replaces the old "git checkout" of a blobless
+          # clone, which died with "fatal: expected 'packfile'" (promisor fetch from googlesource).
           set -u
           BASE="$1"; DIR="$2"; DEST="$3"
           WORK="$(mktemp -d)"; cd "$WORK"
 
-          echo "== listing branches"
-          git ls-remote --heads "$BASE" | sed 's#.*refs/heads/##' > branches.txt || true
-          echo "branches: $(wc -l < branches.txt)"
-          : > cand.txt
-          grep -xE 'main-kernel|mirror-goog-main-llvm-toolchain-source|main|master' branches.txt >> cand.txt || true
-          grep -E '^android-?(1[4-9]|latest)|qpr|^android-?[0-9]+-release' branches.txt | grep -vE '^android-(gs|msm|exynos|arm64)' >> cand.txt || true
-          grep -iE 'llvm|clang|toolchain' branches.txt >> cand.txt || true
-          awk '!seen[$0]++' cand.txt | head -30 > cand.uniq
-          echo "candidate branches:"; cat cand.uniq
-
-          try_checkout() { # repo-dir ref
-            git -C "$1" sparse-checkout init --cone >/dev/null 2>&1
-            git -C "$1" sparse-checkout set "$DIR" >/dev/null 2>&1
-            git -C "$1" checkout -q "$2" 2>&1 | tail -2
-            [ -x "$1/$DIR/bin/clang" ]
+          fetch_archive() { # ref tries
+            local ref="$1" tries="${2:-3}" i
+            for i in $(seq 1 "$tries"); do
+              rm -rf "$DEST"; mkdir -p "$DEST"
+              echo "-- archive $ref (try $i/$tries)"
+              if curl -fsSL --connect-timeout 30 --retry 3 --retry-all-errors "$BASE/+archive/$ref/$DIR.tar.gz" | tar -xzf - -C "$DEST" && [ -x "$DEST/bin/clang" ]; then
+                echo "OK: $DIR from $ref"; return 0
+              fi
+              sleep $((i * 20))
+            done
+            rm -rf "$DEST"; mkdir -p "$DEST"
+            return 1
           }
 
           found=0
-          while read -r b; do
-            [ -n "$b" ] || continue
-            echo "== checking branch $b"
-            rm -rf probe
-            if timeout 600 git clone -q --depth 1 --filter=blob:none --no-checkout --branch "$b" "$BASE" probe 2>/dev/null; then
-              if git -C probe ls-tree --name-only HEAD | grep -qx "$DIR"; then
-                echo "FOUND $DIR on branch $b"
-                if try_checkout probe HEAD; then mkdir -p "$DEST"; cp -a "probe/$DIR/." "$DEST/"; found=1; break; fi
-              fi
+          echo "== searching history of main-kernel"
+          if timeout 1500 git clone -q --filter=blob:none --no-checkout --branch main-kernel "$BASE" hist; then
+            del="$(timeout 1200 git -C hist log --diff-filter=D -1 --format=%H -- "$DIR")"
+            add="$(timeout 1200 git -C hist log --diff-filter=A -1 --format=%H -- "$DIR")"
+            echo "added in: ${add:-?}  deleted in: ${del:-?}"
+            if [ -n "$del" ]; then
+              parent="$(git -C hist rev-parse "$del^" 2>/dev/null || true)"
+              [ -n "$parent" ] && fetch_archive "$parent" 3 && found=1
             fi
-          done < cand.uniq
+            if [ "$found" != 1 ] && [ -n "$add" ]; then fetch_archive "$add" 3 && found=1; fi
+          fi
 
           if [ "$found" != 1 ]; then
-            echo "== not on any branch tip, searching history of main-kernel"
-            rm -rf hist probe
-            if timeout 1500 git clone -q --filter=blob:none --no-checkout --branch main-kernel "$BASE" hist; then
-              del="$(timeout 1200 git -C hist log --diff-filter=D -1 --format=%H -- "$DIR")"
-              add="$(timeout 1200 git -C hist log --diff-filter=A -1 --format=%H -- "$DIR")"
-              echo "added in: ${add:-?}  deleted in: ${del:-?}"
-              ref=""
-              if [ -n "$del" ]; then ref="$del^"; elif [ -n "$add" ]; then ref="$add"; fi
-              if [ -n "$ref" ] && try_checkout hist "$ref"; then mkdir -p "$DEST"; cp -a "hist/$DIR/." "$DEST/"; found=1; fi
-            fi
+            echo "== history failed, trying branch tips"
+            for b in main-kernel master main mirror-goog-main-llvm-toolchain-source; do
+              fetch_archive "refs/heads/$b" 1 && { found=1; break; }
+            done
           fi
 
           [ "$found" = 1 ] || { echo "ERROR: could not find $DIR"; exit 1; }
@@ -374,13 +385,14 @@ jobs:
       - name: Fetch sources at pinned commits
         run: |
           set -eux
-          fetch_sha() { # url sha dir
+          fetch_sha() { # url sha-or-branch dir
             git init -q "$3"
             git -C "$3" remote add origin "$1"
             git -C "$3" fetch -q --depth 1 origin "$2"
             git -C "$3" checkout -q FETCH_HEAD
           }
-          fetch_sha "$KERNEL_REPO" "$KERNEL_SHA" kernel
+          # kernel: pinned SHA if KERNEL_SHA is set, otherwise tip of KERNEL_BRANCH
+          fetch_sha "$KERNEL_REPO" "${KERNEL_SHA:-$KERNEL_BRANCH}" kernel
           fetch_sha "$NOMOUNT_REPO" "$NOMOUNT_SHA" nomount
           # KernelSU-Next: full history, its version number is computed from commit count
           git clone -q --branch "$KSUN_BRANCH" "$KSUN_REPO" ksun
