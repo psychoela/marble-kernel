@@ -9,8 +9,11 @@ env:
   KERNEL_REPO: https://github.com/psychoela/marble-kernel-x
   KERNEL_BRANCH: cnb
   KERNEL_SHA: ""
+  # NoMount v2.x (latest). NOMOUNT_SHA "" = tip of NOMOUNT_BRANCH (the commit is printed in the log).
+  # To pin, put a commit SHA here. Latest tagged release is v2.1.0 (you can use that tag too).
   NOMOUNT_REPO: https://github.com/maxsteeel/nomount
-  NOMOUNT_SHA: 7e7342cd48841cfedd00be2fd20a0311f69c48c5
+  NOMOUNT_BRANCH: master
+  NOMOUNT_SHA: ""
   # Official KernelSU-Next (no SUSFS). The commit used is printed in the log.
   # KSUN_SHA "" = tip of KSUN_BRANCH. To pin, use a commit that exists on that branch
   # (a short SHA is fine). 24b9fdf was tried and is NOT in KernelSU-Next/KernelSU-Next dev.
@@ -73,6 +76,8 @@ jobs:
           grep -q 'r563880c' config.txt
           # the SUSFS LKM needs loadable module support
           grep -q '^CONFIG_MODULES=y' config.txt
+          # NoMount v2 talks to userspace through the keyring API (add_key), so it needs CONFIG_KEYS
+          grep -q '^CONFIG_KEYS=y' config.txt || echo "WARNING: CONFIG_KEYS is not =y in config.txt, NoMount v2 needs it"
           grep -E '^CONFIG_(MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|KALLSYMS|KALLSYMS_ALL|KPROBES)=' config.txt || true
           echo "config.txt looks right"
 
@@ -393,7 +398,9 @@ jobs:
           }
           # kernel: pinned SHA if KERNEL_SHA is set, otherwise tip of KERNEL_BRANCH
           fetch_sha "$KERNEL_REPO" "${KERNEL_SHA:-$KERNEL_BRANCH}" kernel
-          fetch_sha "$NOMOUNT_REPO" "$NOMOUNT_SHA" nomount
+          fetch_sha "$NOMOUNT_REPO" "${NOMOUNT_SHA:-$NOMOUNT_BRANCH}" nomount
+          git -C nomount log -1 --format='nomount %H %s'
+          ls -la nomount/kernel/src
           # KernelSU-Next: full history, its version number is computed from commit count
           git clone -q --branch "$KSUN_BRANCH" "$KSUN_REPO" ksun
           if [ -n "$KSUN_SHA" ]; then git -C ksun checkout -q "$KSUN_SHA"; fi
