@@ -656,7 +656,8 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends \
             flex bison bc cpio libssl-dev libelf-dev xz-utils python3 binutils \
-            make gcc g++ git ca-certificates curl python-is-python3 perl
+            make gcc g++ git ca-certificates curl python-is-python3 perl \
+            libxml2 libzstd1 zlib1g libtinfo6
           head -2 /etc/os-release
           # repo is owned by another uid than root: let git (used by Kbuild) work anyway
           git config --global --add safe.directory '*'
