@@ -1,0 +1,810 @@
+name: Build marble kernel from psychoela/marble-kernel-x (NoMount + FinaSU + SUSFS LKM module, real uname, Android clang 21 (r563880c), Debian container)
+
+on:
+  workflow_dispatch:
+    inputs:
+      clang_choice:
+        description: "Which clang to build with"
+        type: choice
+        default: llvm-22.1.8
+        options:
+          - llvm-22.1.8
+          - android-r563880c
+
+env:
+  # Your own kernel source (fork of Evolution-X kernel_xiaomi_sm8450, branch cnb, 5.10.269).
+  # KERNEL_SHA "" = tip of KERNEL_BRANCH (the commit is printed in the log). To pin, put a commit SHA here.
+  KERNEL_REPO: https://github.com/psychoela/marble-kernel-x
+  KERNEL_BRANCH: cnb
+  KERNEL_SHA: ""
+  # NoMount v2.x (latest). NOMOUNT_SHA "" = tip of NOMOUNT_BRANCH (the commit is printed in the log).
+  # To pin, put a commit SHA here. Latest tagged release is v2.1.0 (you can use that tag too).
+  NOMOUNT_REPO: https://github.com/maxsteeel/nomount
+  NOMOUNT_BRANCH: master
+  NOMOUNT_SHA: ""
+  # FinaSU (LyraVoid/FinaSU, a KernelSU fork). The commit used is printed in the log.
+  # FINASU_SHA "" = tip of FINASU_BRANCH. To pin, use a commit that exists on that branch
+  # (a short SHA is fine). FINASU_BRANCH can also be a release tag: use the tag of the manager APK
+  # you installed if the manager and the kernel ever disagree on the version.
+  FINASU_REPO: https://github.com/LyraVoid/FinaSU
+  FINASU_BRANCH: master
+  FINASU_SHA: ""
+  # Android clang to use. Change these two lines to try another toolchain.
+  CLANG_DIR: clang-r563880c
+  CLANG_MAJOR: "21"
+  EXPECTED_RELEASE: 5.10.269-gki-gc3d1c3d93062
+  BUILD_IMAGE: debian:bookworm-slim
+  # Version that apps see in `uname -r`, /proc/version and /proc/sys/kernel/osrelease.
+  # DISPLAY ONLY: the kernel itself stays 5.10.269. kernel.release, LINUX_VERSION_CODE and the
+  # module vermagic are NOT changed, so the vendor modules and FinaSU build and load as before.
+  # Boot-critical Android daemons (bpfloader, netd, init, vintf, system_server, modprobe,
+  # ueventd, clatd) are still shown the real version, because they pick features by kernel version.
+  # Set to "" to turn this off completely (try that first if you ever bootloop).
+  UNAME_FAKE_VERSION: ""
+  # Turn off seccomp in the whole kernel (CONFIG_SECCOMP + CONFIG_SECCOMP_FILTER).
+  # WARNING: this very likely breaks boot. It changes struct task_struct, so the
+  # vendor modules fail the modversions check, and Android's zygote expects seccomp.
+  # Keep "0" unless you accept the risk of a bootloop (set to "1" to try it).
+  DISABLE_SECCOMP: "0"
+  # SUSFS as a loadable kernel module (NOT built into the kernel). This builds the KernelSU module
+  # ZIP "susfs-lkm-module" (loader for inforcqb/susfs4ksu-lkm). Install that ZIP in the FinaSU
+  # manager after flashing the kernel, then reboot. Set to "0" to skip it.
+  ENABLE_SUSFS_LKM: "1"
+  SUSFS_LKM_REPO: https://github.com/matsuzaka-yuki/susfs-lkm-module
+  # "" = tip of main (the commit is printed in the log). Put a commit SHA here to pin it.
+  SUSFS_LKM_SHA: ""
+  # The loader picks its .ko from the real kernel release with a pattern like 5.10.*-android12-*.
+  # This kernel's real release is 5.10.269-gki-gc3d1c3d93062 (no "android12"), so we add a pattern
+  # for it. Which .ko to use: android12-5.10 or android13-5.10 (the KMI of your stock kernel).
+  SUSFS_LKM_KMI: android12-5.10
+  # Add a status marker and a status log to the SUSFS LKM module ("1" = on, "0" = off):
+  #  - the module description in the manager starts with [✅ SUSFS active, <kmi>] (or ❌ / ⚠️)
+  #  - /data/adb/susfs_lkm_loader/status.log lists what is loaded and active
+  #  - /data/adb/susfs_lkm_loader/options.conf (created on the phone) turns each one on/off later
+  #  - the module's Action button refreshes both and prints the status
+  SUSFS_LKM_STATUS: "1"
+
+jobs:
+  build:
+    # GitHub only offers Ubuntu/Windows/macOS hosts. The host is only used to run
+    # Docker; the whole kernel build happens inside a Debian container.
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout (for config.txt)
+        uses: actions/checkout@v4
+
+      - name: Check that config.txt is the phone's real kernel config
+        run: |
+          set -eu
+          test -s config.txt || { echo "config.txt missing in repo root"; exit 1; }
+          grep -q '^CONFIG_LTO_CLANG_FULL=y' config.txt
+          grep -q '^CONFIG_CFI_CLANG=y' config.txt
+          grep -q 'r563880c' config.txt
+          # the SUSFS LKM needs loadable module support
+          grep -q '^CONFIG_MODULES=y' config.txt
+          # NoMount v2 talks to userspace through the keyring API (add_key), so it needs CONFIG_KEYS
+          grep -q '^CONFIG_KEYS=y' config.txt || echo "WARNING: CONFIG_KEYS is not =y in config.txt, NoMount v2 needs it"
+          grep -E '^CONFIG_(MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|KALLSYMS|KALLSYMS_ALL|KPROBES)=' config.txt || true
+          echo "config.txt looks right"
+
+      # Must run BEFORE "Free disk space": that step deletes /usr/local/lib/android (the Android NDK),
+      # and the module build needs the NDK to compile its small probe binary.
+      - name: Fetch SUSFS LKM module and patch kmi.sh
+        if: env.ENABLE_SUSFS_LKM == '1'
+        continue-on-error: true
+        run: |
+          set -eux
+          git clone -q "$SUSFS_LKM_REPO" susfs-lkm-module
+          if [ -n "$SUSFS_LKM_SHA" ]; then git -C susfs-lkm-module checkout -q "$SUSFS_LKM_SHA"; fi
+          git -C susfs-lkm-module log -1 --format='susfs-lkm-module %H %s'
+          cd susfs-lkm-module
+
+          # Upstream kmi.sh changed format (the old "5.10.*-android12-*)" case line is gone), so a
+          # sed on one line no longer works. Instead: rename the upstream select_kmi() and put a
+          # small wrapper in front of it that maps this kernel's "-gki-" release to $SUSFS_LKM_KMI.
+          echo "---- upstream kmi.sh ----"; cat module/kmi.sh; echo "---- end ----"
+          grep -qE '^select_kmi[[:space:]]*\(\)' module/kmi.sh || { echo "ERROR: select_kmi() not found in module/kmi.sh (see the file printed above)"; exit 1; }
+          sed -i -E 's/^select_kmi[[:space:]]*\(\)/select_kmi_upstream()/' module/kmi.sh
+          printf '\n' >> module/kmi.sh
+          cat >> module/kmi.sh <<KMI_EOF
+          select_kmi() {
+            case "\$1" in
+              5.10.*-gki-*) echo "$SUSFS_LKM_KMI"; return 0 ;;
+            esac
+            select_kmi_upstream "\$@"
+          }
+          KMI_EOF
+          grep -q -- '5.10.\*-gki-\*)' module/kmi.sh || { echo "ERROR: could not patch module/kmi.sh"; exit 1; }
+          sh -n module/kmi.sh
+          # quick self-test of the wrapper
+          sh -c '. ./module/kmi.sh && test "$(select_kmi 5.10.269-gki-gc3d1c3d93062)" = "$SUSFS_LKM_KMI"' || { echo "ERROR: select_kmi self-test failed"; exit 1; }
+          tail -12 module/kmi.sh
+
+      - name: Add status marker and status log to the SUSFS LKM module
+        if: env.ENABLE_SUSFS_LKM == '1' && env.SUSFS_LKM_STATUS == '1'
+        continue-on-error: true
+        run: |
+          set -eux
+          cd susfs-lkm-module
+          for f in status.sh service.sh action.sh; do
+            [ ! -e "module/$f" ] || { echo "ERROR: module/$f already exists upstream, not overwriting"; exit 1; }
+          done
+          cat > module/status.sh <<'STATUS_EOF'
+          #!/system/bin/sh
+          # SPDX-License-Identifier: GPL-2.0-only
+          # Status marker + status log for the SUSFS LKM loader. Sourced by service.sh and action.sh.
+          # Read-only: it never loads, unloads or changes SUSFS rules.
+          MODDIR=${MODDIR:-${0%/*}}
+          DATA=${SUSFS_LKM_DATA:-/data/adb/susfs_lkm_loader}
+          CONF=$DATA/options.conf
+          LOG=$DATA/status.log
+          PROP=$MODDIR/module.prop
+
+          susfs_load_options() {
+            STATUS_MARKER=1
+            STATUS_LOG=1
+            mkdir -p "$DATA" 2>/dev/null
+            if [ ! -f "$CONF" ]; then
+              cat > "$CONF" <<'OPT'
+          # SUSFS LKM Loader options. 1 = on, 0 = off.
+          # Applied at boot and when you press the Action button of this module.
+          # Put a check mark in front of the module description in the manager.
+          STATUS_MARKER=1
+          # Write /data/adb/susfs_lkm_loader/status.log (what is loaded and active).
+          STATUS_LOG=1
+          OPT
+            fi
+            . "$CONF"
+          }
+
+          susfs_state() {
+            LOADED=0
+            [ -d /sys/module/susfs_guard_lkm ] && LOADED=1
+            "$MODDIR/bin/susfs_probe" >/dev/null 2>&1
+            PROBE=$?
+            if [ "$LOADED" = 1 ] && [ "$PROBE" = 0 ]; then
+              MARK="✅"; TEXT="SUSFS active"
+            elif [ "$PROBE" = 0 ]; then
+              MARK="✅"; TEXT="SUSFS active (not from this loader)"
+            elif [ "$LOADED" = 1 ]; then
+              MARK="⚠️"; TEXT="LKM loaded but SUSFS not answering"
+            else
+              MARK="❌"; TEXT="SUSFS not loaded"
+            fi
+          }
+
+          susfs_write_log() {
+            {
+              echo "SUSFS LKM Loader status"
+              echo "time: $(date)"
+              echo "state: $MARK $TEXT"
+              echo "kernel: $(cat /proc/sys/kernel/osrelease 2>/dev/null)"
+              echo "kmi: $KMI"
+              echo "module version: $(sed -n 's/^version=//p' "$PROP" | head -1)"
+              echo "lkm loaded: $LOADED   probe rc: $PROBE (0 = SUSFS interface answers)"
+              echo
+              echo "== /sys/module/susfs_guard_lkm/parameters"
+              if [ -d /sys/module/susfs_guard_lkm/parameters ]; then
+                for p in /sys/module/susfs_guard_lkm/parameters/*; do
+                  [ -f "$p" ] && echo "${p##*/} = $(cat "$p" 2>/dev/null)"
+                done
+              else
+                echo "(none)"
+              fi
+              echo
+              echo "== /proc/susfs* control nodes (features that are active)"
+              found=0
+              for n in /proc/susfs*; do
+                [ -e "$n" ] || continue
+                found=1
+                echo "$n"
+              done
+              [ "$found" = 0 ] && echo "(none; the nodes exist only while the LKM runs with expose_proc=1)"
+              echo
+              if [ -r /proc/susfs_hide_mounts ]; then
+                echo "== /proc/susfs_hide_mounts (hidden mount prefixes)"
+                cat /proc/susfs_hide_mounts 2>&1
+                echo
+              fi
+              echo "== ksu_susfs"
+              KS=$(command -v ksu_susfs 2>/dev/null)
+              [ -x "$KS" ] || KS=/data/adb/ksu/bin/ksu_susfs
+              T=""
+              command -v timeout >/dev/null 2>&1 && T="timeout 5"
+              if [ -x "$KS" ]; then
+                for a in "show version" "show variant" "show enabled_features"; do
+                  echo "\$ ksu_susfs $a"
+                  $T "$KS" $a 2>&1
+                  echo
+                done
+              else
+                echo "(ksu_susfs binary not found; rules are managed by FolkSU or another tool)"
+              fi
+              echo "== load.log (written at boot by post-fs-data.sh)"
+              cat "$MODDIR/load.log" 2>/dev/null
+            } > "$LOG" 2>&1
+          }
+
+          susfs_update_prop() {
+            [ -f "$PROP" ] || return 0
+            desc=$(sed -n 's/^description=//p' "$PROP" | head -1)
+            desc=$(printf '%s' "$desc" | sed 's/^\[[^]]*\] *//')
+            if [ "$STATUS_MARKER" = 1 ]; then
+              desc="[$MARK $TEXT, $KMI] $desc"
+            fi
+            { grep -v '^description=' "$PROP"; printf 'description=%s\n' "$desc"; } > "$PROP.tmp" \
+              && cat "$PROP.tmp" > "$PROP"
+            rm -f "$PROP.tmp"
+          }
+
+          susfs_status_update() {
+            susfs_load_options
+            KMI=$(. "$MODDIR/kmi.sh" 2>/dev/null && select_kmi "$(cat /proc/sys/kernel/osrelease)") || KMI=unknown
+            susfs_state
+            if [ "$STATUS_LOG" = 1 ]; then
+              susfs_write_log
+            else
+              rm -f "$LOG"
+            fi
+            susfs_update_prop
+          }
+          STATUS_EOF
+          cat > module/service.sh <<'SERVICE_EOF'
+          #!/system/bin/sh
+          # SPDX-License-Identifier: GPL-2.0-only
+          MODDIR=${0%/*}
+          [ ! -f "$MODDIR/disable" ] && [ ! -f "$MODDIR/remove" ] || exit 0
+          . "$MODDIR/status.sh"
+          i=0
+          while [ "$(getprop sys.boot_completed)" != 1 ] && [ "$i" -lt 90 ]; do
+            sleep 2
+            i=$((i + 1))
+          done
+          susfs_status_update
+          SERVICE_EOF
+          cat > module/action.sh <<'ACTION_EOF'
+          #!/system/bin/sh
+          # SPDX-License-Identifier: GPL-2.0-only
+          MODDIR=${0%/*}
+          . "$MODDIR/status.sh"
+          susfs_status_update
+          echo "$MARK $TEXT"
+          echo "KMI: $KMI"
+          echo
+          if [ "$STATUS_LOG" = 1 ]; then
+            sed -n '1,40p' "$LOG"
+          else
+            echo "Status log is off (STATUS_LOG=0)."
+          fi
+          echo
+          echo "Options: $CONF"
+          echo "Full log: $LOG"
+          ACTION_EOF
+          printf '\n' >> module/customize.sh
+          cat >> module/customize.sh <<'CUST_EOF'
+          set_perm "$MODPATH/status.sh" 0 0 0755
+          set_perm "$MODPATH/service.sh" 0 0 0755
+          set_perm "$MODPATH/action.sh" 0 0 0755
+          ui_print "- Status marker + status log: /data/adb/susfs_lkm_loader/ (options.conf, status.log)"
+          CUST_EOF
+          for f in status.sh service.sh action.sh customize.sh; do sh -n "module/$f"; done
+          tail -6 module/customize.sh
+
+      - name: Build SUSFS LKM module ZIP (host, uses Android NDK)
+        if: env.ENABLE_SUSFS_LKM == '1'
+        continue-on-error: true
+        run: |
+          set -eux
+          cd susfs-lkm-module
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
+          test -d "$ANDROID_NDK_HOME" || { echo "ERROR: Android NDK not found on the runner"; exit 1; }
+          echo "NDK: $ANDROID_NDK_HOME"
+          python3 tools/build.py
+          ls -la dist/
+          cp dist/susfs-lkm-module-*.zip "$GITHUB_WORKSPACE/susfs-lkm-module.zip"
+          unzip -l "$GITHUB_WORKSPACE/susfs-lkm-module.zip" | grep -E 'kmi.sh|\.ko|susfs_insmod'
+          unzip -p "$GITHUB_WORKSPACE/susfs-lkm-module.zip" kmi.sh | grep -q -- '-gki-'
+          if [ "$SUSFS_LKM_STATUS" = 1 ]; then unzip -l "$GITHUB_WORKSPACE/susfs-lkm-module.zip" | grep -E 'status.sh|service.sh|action.sh'; fi
+
+
+      - name: Free disk space and add swap (host)
+        run: |
+          set -eux
+          # Full LTO + CFI link of vmlinux.o needs far more than the runner's ~7 GB RAM
+          # (previous run: "Killed" / Error 137 = OOM). Free as much disk as possible and
+          # turn it into a big swap file.
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/.ghcup /usr/share/swift /usr/local/share/boost /usr/lib/jvm \
+            /usr/local/julia* /usr/local/share/chromium /opt/microsoft /usr/lib/google-cloud-sdk \
+            /usr/share/miniconda /opt/az /usr/local/aws-cli /usr/local/share/powershell || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile || true
+          AVAIL_G="$(df --output=avail -BG /mnt | tail -1 | tr -dc '0-9')"
+          # keep ~22 GB for clang, kernel tree and out/, rest goes to swap (8..40 GB)
+          SWAP_G=$(( AVAIL_G - 22 ))
+          [ "$SWAP_G" -gt 40 ] && SWAP_G=40
+          [ "$SWAP_G" -lt 8 ] && SWAP_G=8
+          echo "available ${AVAIL_G}G -> swap ${SWAP_G}G"
+          sudo fallocate -l "${SWAP_G}G" /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          sudo sysctl vm.swappiness=100 || true
+          df -h / /mnt
+          free -g
+          nproc
+
+      - name: Download Android clang
+        if: ${{ inputs.clang_choice == 'android-r563880c' }}
+        run: |
+          set -eux
+          cat > fetch-clang.sh <<'EOF'
+          #!/bin/bash
+          # usage: fetch-clang.sh <repo-url> <clang-dir> <dest>
+          # clang-r563880c is no longer on any branch tip. Find the last commit that still had it
+          # (history of main-kernel, metadata only, a few seconds) and download ONLY that directory
+          # as a tar.gz from Gitiles (+archive). This replaces the old "git checkout" of a blobless
+          # clone, which died with "fatal: expected 'packfile'" (promisor fetch from googlesource).
+          set -u
+          BASE="$1"; DIR="$2"; DEST="$3"
+          WORK="$(mktemp -d)"; cd "$WORK"
+
+          fetch_archive() { # ref tries
+            local ref="$1" tries="${2:-3}" i
+            for i in $(seq 1 "$tries"); do
+              rm -rf "$DEST"; mkdir -p "$DEST"
+              echo "-- archive $ref (try $i/$tries)"
+              if curl -fsSL --connect-timeout 30 --retry 3 --retry-all-errors "$BASE/+archive/$ref/$DIR.tar.gz" | tar -xzf - -C "$DEST" && [ -x "$DEST/bin/clang" ]; then
+                echo "OK: $DIR from $ref"; return 0
+              fi
+              sleep $((i * 20))
+            done
+            rm -rf "$DEST"; mkdir -p "$DEST"
+            return 1
+          }
+
+          found=0
+          echo "== searching history of main-kernel"
+          if timeout 1500 git clone -q --filter=blob:none --no-checkout --branch main-kernel "$BASE" hist; then
+            del="$(timeout 1200 git -C hist log --diff-filter=D -1 --format=%H -- "$DIR")"
+            add="$(timeout 1200 git -C hist log --diff-filter=A -1 --format=%H -- "$DIR")"
+            echo "added in: ${add:-?}  deleted in: ${del:-?}"
+            if [ -n "$del" ]; then
+              parent="$(git -C hist rev-parse "$del^" 2>/dev/null || true)"
+              [ -n "$parent" ] && fetch_archive "$parent" 3 && found=1
+            fi
+            if [ "$found" != 1 ] && [ -n "$add" ]; then fetch_archive "$add" 3 && found=1; fi
+          fi
+
+          if [ "$found" != 1 ]; then
+            echo "== history failed, trying branch tips"
+            for b in main-kernel master main mirror-goog-main-llvm-toolchain-source; do
+              fetch_archive "refs/heads/$b" 1 && { found=1; break; }
+            done
+          fi
+
+          [ "$found" = 1 ] || { echo "ERROR: could not find $DIR"; exit 1; }
+          echo "OK: copied $DIR to $DEST"
+          EOF
+          mkdir -p "$HOME/clang"
+          bash fetch-clang.sh https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "$CLANG_DIR" "$HOME/clang"
+          "$HOME/clang/bin/clang" --version
+          "$HOME/clang/bin/clang" --version | grep -q "clang version $CLANG_MAJOR\." || { echo "Expected clang $CLANG_MAJOR but got something else. Check CLANG_DIR."; exit 1; }
+          du -sh "$HOME/clang"
+
+      - name: Download upstream LLVM 22.1.8
+        if: ${{ inputs.clang_choice == 'llvm-22.1.8' }}
+        run: |
+          set -eux
+          V=22.1.8
+          mkdir -p "$HOME/clang"
+          cd "$(mktemp -d)"
+          ok=0
+          for f in "LLVM-$V-Linux-X64.tar.xz" "clang+llvm-$V-x86_64-linux-gnu-ubuntu-22.04.tar.xz"; do
+            echo "-- trying $f"
+            if curl -fsSL --connect-timeout 30 --retry 3 --retry-all-errors -o clang.tar.xz \
+                 "https://github.com/llvm/llvm-project/releases/download/llvmorg-$V/$f"; then
+              ok=1; break
+            fi
+          done
+          [ "$ok" = 1 ] || { echo "ERROR: no prebuilt LLVM $V Linux x86_64 tarball found on the release page"; exit 1; }
+          tar -xJf clang.tar.xz -C "$HOME/clang" --strip-components=1
+          "$HOME/clang/bin/clang" --version
+          "$HOME/clang/bin/clang" --version | grep -q "clang version 22\.1\.8" || { echo "Expected clang 22.1.8"; exit 1; }
+          for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
+            test -x "$HOME/clang/bin/$t" || { echo "MISSING $t"; exit 1; }
+          done
+          du -sh "$HOME/clang"
+
+      - name: Fetch sources at pinned commits
+        run: |
+          set -eux
+          fetch_sha() { # url sha-or-branch dir
+            git init -q "$3"
+            git -C "$3" remote add origin "$1"
+            git -C "$3" fetch -q --depth 1 origin "$2"
+            git -C "$3" checkout -q FETCH_HEAD
+          }
+          # kernel: pinned SHA if KERNEL_SHA is set, otherwise tip of KERNEL_BRANCH
+          fetch_sha "$KERNEL_REPO" "${KERNEL_SHA:-$KERNEL_BRANCH}" kernel
+          fetch_sha "$NOMOUNT_REPO" "${NOMOUNT_SHA:-$NOMOUNT_BRANCH}" nomount
+          git -C nomount log -1 --format='nomount %H %s'
+          ls -la nomount/kernel/src
+          # FinaSU: full history, its version number is computed from commit count
+          git clone -q --branch "$FINASU_BRANCH" "$FINASU_REPO" finasu
+          if [ -n "$FINASU_SHA" ]; then git -C finasu checkout -q "$FINASU_SHA"; fi
+          git -C finasu log -1 --format='FinaSU %H %s'
+          test -f finasu/kernel/Kconfig || { echo "ERROR: finasu/kernel/Kconfig not found"; exit 1; }
+          ls -la finasu/kernel
+          grep -nE '^config KSU' finasu/kernel/Kconfig || echo "WARNING: no 'config KSU' symbol in finasu/kernel/Kconfig"
+          git -C kernel log -1 --format='kernel %H %s'
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
+
+      - name: Integrate NoMount and FinaSU
+        run: |
+          set -eux
+          K="$PWD/kernel"
+
+          add_source() { # file, line to insert before the last "endmenu"
+            if ! grep -qF "$2" "$1"; then
+              awk -v line="$2" '/^endmenu/{l=NR} {a[NR]=$0} END{for(i=1;i<=NR;i++){if(i==l)print line; print a[i]}}' "$1" > "$1.tmp"
+              mv "$1.tmp" "$1"
+            fi
+          }
+
+          # The fork may already contain leftovers (a file/symlink named fs/nomount made
+          # "mkdir -p" fail with "File exists"). Show what is there, then start clean.
+          ls -ld "$K/fs/nomount" "$K/drivers/kernelsu" "$K/FinaSU" 2>&1 || true
+          rm -rf "$K/fs/nomount" "$K/drivers/kernelsu" "$K/FinaSU"
+
+          # NoMount: copy source into fs/nomount
+          mkdir -p "$K/fs/nomount"
+          cp -f nomount/kernel/src/* "$K/fs/nomount/"
+          grep -q nomount "$K/fs/Makefile" || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "$K/fs/Makefile"
+          add_source "$K/fs/Kconfig" 'source "fs/nomount/Kconfig"'
+
+          # FinaSU: keep it a git repo inside the tree, symlink like KernelSU's setup.sh does
+          mv finasu "$K/FinaSU"
+          ln -sfn ../FinaSU/kernel "$K/drivers/kernelsu"
+          grep -q kernelsu "$K/drivers/Makefile" || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$K/drivers/Makefile"
+          add_source "$K/drivers/Kconfig" 'source "drivers/kernelsu/Kconfig"'
+
+          grep -n nomount "$K/fs/Makefile" "$K/fs/Kconfig"
+          grep -n kernelsu "$K/drivers/Makefile" "$K/drivers/Kconfig"
+
+      - name: Provide __stack_chk_guard for the SUSFS LKM
+        if: env.ENABLE_SUSFS_LKM == '1'
+        run: |
+          set -eux
+          K="$PWD/kernel"
+          # This kernel uses CONFIG_STACKPROTECTOR_PER_TASK, so it has no global __stack_chk_guard.
+          # The prebuilt susfs_guard_lkm-*.ko still references it (load.log: "unresolved
+          # __stack_chk_guard", init_module ENOENT). A plain global variable fixes that. It adds one
+          # symbol only: no struct or existing symbol changes, so vendor modules are unaffected.
+          cat > "$K/kernel/susfs_lkm_support.c" <<'CEOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * Global stack protector guard for prebuilt LKMs that were compiled with the global
+           * guard model. The kernel itself keeps using its per-task canary and never reads this.
+           */
+          #include <linux/compiler.h>
+          #include <linux/export.h>
+
+          unsigned long __stack_chk_guard __used = 0x5f5ec0de5f5ec0deUL;
+          EXPORT_SYMBOL(__stack_chk_guard);
+          CEOF
+          grep -q 'susfs_lkm_support' "$K/kernel/Makefile" || printf '\nobj-y += susfs_lkm_support.o\n' >> "$K/kernel/Makefile"
+          tail -3 "$K/kernel/Makefile"
+
+      - name: Show the fake version in uname (display only)
+        if: env.UNAME_FAKE_VERSION != ''
+        run: |
+          set -eux
+          K="$PWD/kernel"
+
+          cat > "$K/include/linux/uname_spoof.h" <<'CEOF'
+          /* SPDX-License-Identifier: GPL-2.0 */
+          #ifndef _LINUX_UNAME_SPOOF_H
+          #define _LINUX_UNAME_SPOOF_H
+
+          #include <linux/types.h>
+
+          /*
+           * Returns the release string to show to the current process. If a different
+           * version has to be shown, it is written to out (out may be the same buffer
+           * as real) and out is returned; otherwise real is returned untouched.
+           */
+          const char *uname_spoof_release(const char *real, char *out, size_t len);
+
+          #endif
+          CEOF
+
+          cat > "$K/kernel/uname_spoof.c" <<'CEOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /*
+           * Display-only kernel version. The real kernel (UTS_RELEASE, LINUX_VERSION_CODE,
+           * module vermagic) is not touched. Android daemons that choose features by
+           * kernel version keep seeing the real version.
+           */
+          #include <linux/kernel.h>
+          #include <linux/sched.h>
+          #include <linux/cred.h>
+          #include <linux/uidgid.h>
+          #include <linux/string.h>
+          #include <linux/utsname.h>
+          #include <linux/uname_spoof.h>
+
+          #define UNAME_FAKE_VERSION "@FAKE@"
+
+          static const char * const real_version_comms[] = {
+          	"bpfloader", "netbpfload", "netd", "init", "vintf",
+          	"system_server", "modprobe", "ueventd", "clatd", NULL,
+          };
+
+          static bool caller_needs_real_version(void)
+          {
+          	const char *comm = current->comm;
+          	int i;
+
+          	/*
+          	 * Root always sees the real release: KernelSU module scripts (the SUSFS LKM loader
+          	 * picks its .ko from the real 5.10.x release) and ksud run as uid 0.
+          	 */
+          	if (uid_eq(current_uid(), GLOBAL_ROOT_UID))
+          		return true;
+
+          	for (i = 0; real_version_comms[i]; i++)
+          		if (strstr(comm, real_version_comms[i]))
+          			return true;
+          	return false;
+          }
+
+          const char *uname_spoof_release(const char *real, char *out, size_t len)
+          {
+          	char base[__NEW_UTS_LEN + 1];
+          	const char *dash;
+
+          	/* only touch 5.10.x releases, leave anything else alone */
+          	if (strncmp(real, "5.10.", 5) || caller_needs_real_version())
+          		return real;
+
+          	strlcpy(base, real, sizeof(base));
+          	dash = strchr(base, '-');
+          	snprintf(out, len, "%s%s", UNAME_FAKE_VERSION, dash ? dash : "");
+          	return out;
+          }
+          CEOF
+          sed -i "s/@FAKE@/$UNAME_FAKE_VERSION/" "$K/kernel/uname_spoof.c"
+          grep -n 'define UNAME_FAKE_VERSION' "$K/kernel/uname_spoof.c"
+          grep -q 'uname_spoof' "$K/kernel/Makefile" || printf '\nobj-y += uname_spoof.o\n' >> "$K/kernel/Makefile"
+
+          # Hook the three places where userspace reads the release string.
+          # Every anchor is asserted: if the source differs, this step fails instead of guessing.
+          python3 - "$K" <<'PYEOF'
+          import re, sys
+          K = sys.argv[1]
+
+          def read(p):
+              with open(f"{K}/{p}") as f:
+                  return f.read()
+
+          def write(p, s):
+              with open(f"{K}/{p}", "w") as f:
+                  f.write(s)
+
+          def add_include(s):
+              m = re.search(r'^#include <linux/[^\n]*\n', s, re.M)
+              assert m, "no #include <linux/...> line found"
+              return s[:m.end()] + '#include <linux/uname_spoof.h>\n' + s[m.end():]
+
+          # 1) uname(2): newuname only (arm64 maps uname and compat uname to it)
+          p = "kernel/sys.c"
+          s = read(p)
+          i = s.index("SYSCALL_DEFINE1(newuname,")
+          tag = "up_read(&uts_sem);"
+          j = s.index(tag, i)
+          assert j - i < 600, "up_read(&uts_sem) is not inside newuname"
+          j += len(tag)
+          s = s[:j] + "\n\tuname_spoof_release(tmp.release, tmp.release, sizeof(tmp.release));" + s[j:]
+          write(p, add_include(s))
+
+          # 2) /proc/sys/kernel/osrelease
+          p = "kernel/utsname_sysctl.c"
+          s = read(p)
+          old = "memcpy(tmp_data, get_uts(table), sizeof(tmp_data));\n\tup_read(&uts_sem);\n"
+          assert s.count(old) == 1, "utsname_sysctl.c anchor not found exactly once"
+          new = old + '\tif (!write && table->procname && !strcmp(table->procname, "osrelease"))\n\t\tuname_spoof_release(tmp_data, tmp_data, sizeof(tmp_data));\n'
+          write(p, add_include(s.replace(old, new)))
+
+          # 3) /proc/version
+          p = "fs/proc/version.c"
+          s = read(p)
+          s, n = re.subn(r'(static int version_proc_show\(struct seq_file \*m, void \*v\)\s*\{\n)', r'\1\tchar spoof_rel[__NEW_UTS_LEN + 1];\n\n', s, count=1)
+          assert n == 1, "version_proc_show not found"
+          assert s.count("utsname()->release,") == 1, "utsname()->release anchor not found exactly once"
+          s = s.replace("utsname()->release,", "uname_spoof_release(utsname()->release, spoof_rel, sizeof(spoof_rel)),")
+          write(p, add_include(s))
+          print("uname hooks applied")
+          PYEOF
+
+          grep -n -B1 -A2 'uname_spoof_release' "$K/kernel/sys.c" "$K/kernel/utsname_sysctl.c" "$K/fs/proc/version.c"
+
+      - name: Show which FinaSU is being built
+        continue-on-error: true
+        run: |
+          set -eu
+          cd kernel/FinaSU
+          echo "FinaSU commit = $(git rev-parse HEAD)"
+          echo "FinaSU describe = $(git describe --tags --always 2>/dev/null || true)"
+          echo "FinaSU commit count = $(git rev-list --count HEAD)"
+          # FinaSU's hook manager uses kprobes: warn early if the kernel config has none
+          grep -q '^CONFIG_KPROBES=y' "$GITHUB_WORKSPACE/config.txt" || echo "WARNING: CONFIG_KPROBES is not =y in config.txt, FinaSU hooks need it"
+
+      - name: Write in-container build script
+        run: |
+          cat > ci-build.sh <<'EOF'
+          #!/bin/bash
+          # Runs INSIDE the Debian container. /w = workspace, /clang = Android clang
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            flex bison bc cpio libssl-dev libelf-dev xz-utils python3 binutils \
+            make gcc g++ git ca-certificates curl python-is-python3 perl \
+            libxml2 libzstd1 zlib1g libtinfo6
+          head -2 /etc/os-release
+          # repo is owned by another uid than root: let git (used by Kbuild) work anyway
+          git config --global --add safe.directory '*'
+          export PATH=/clang/bin:$PATH
+          clang --version | sed -n 1p
+          cd /w/kernel
+          MK="ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ O=out LOCALVERSION="
+
+          mkdir -p out
+          cp ../config.txt out/.config
+          printf 'CONFIG_NOMOUNT=y\nCONFIG_KSU=y\n' >> out/.config
+          # Use tracepoint hook mode when this KernelSU fork offers it (ignored otherwise)
+          if grep -rqE 'config KSU_TRACEPOINT_HOOK' /w/kernel/FinaSU/kernel --include='Kconfig*'; then
+            echo 'CONFIG_KSU_TRACEPOINT_HOOK=y' >> out/.config
+          fi
+          # TCP BBR + Westwood (+ fq qdisc, which BBR works best with). Selectable at runtime; the default stays cubic.
+          printf 'CONFIG_TCP_CONG_ADVANCED=y\nCONFIG_TCP_CONG_BBR=y\nCONFIG_TCP_CONG_WESTWOOD=y\nCONFIG_NET_SCH_FQ=y\n' >> out/.config
+          # fq_codel + cake qdiscs, TTL/HL iptables target (hotspot TTL), WireGuard VPN
+          printf 'CONFIG_NET_SCH_FQ_CODEL=y\nCONFIG_NET_SCH_CAKE=y\nCONFIG_NETFILTER_XT_TARGET_HL=y\nCONFIG_WIREGUARD=y\n' >> out/.config
+          grep -rnE 'config KSU_[A-Z0-9_]*HOOK' /w/kernel/FinaSU/kernel --include='Kconfig*' || true
+
+          # Optional: seccomp off (see DISABLE_SECCOMP in the workflow env)
+          if [ "${DISABLE_SECCOMP:-0}" = 1 ]; then
+            sed -i 's/^CONFIG_SECCOMP=y/# CONFIG_SECCOMP is not set/; s/^CONFIG_SECCOMP_FILTER=y/# CONFIG_SECCOMP_FILTER is not set/' out/.config
+          fi
+          # newer clang adds new warnings; do not let CONFIG_WERROR turn them into errors
+          sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
+          sed -i 's/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION="-gki-gc3d1c3d93062"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/' out/.config
+          make $MK olddefconfig
+          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|NOMOUNT|KSU|LTO_CLANG_FULL|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|KALLSYMS|KALLSYMS_ALL|KPROBES|LOCALVERSION|DEBUG_INFO|DEBUG_INFO_BTF)=' out/.config || true
+          # These must survive olddefconfig, otherwise vendor modules will not load
+          grep -q '^CONFIG_NOMOUNT=y' out/.config
+          grep -q '^CONFIG_KSU=y' out/.config
+          grep -q '^CONFIG_MODULES=y' out/.config
+          grep -q '^CONFIG_TCP_CONG_BBR=y' out/.config
+          grep -q '^CONFIG_TCP_CONG_WESTWOOD=y' out/.config
+          grep -q '^CONFIG_NET_SCH_FQ=y' out/.config
+          grep -q '^CONFIG_NET_SCH_FQ_CODEL=y' out/.config
+          grep -q '^CONFIG_NET_SCH_CAKE=y' out/.config
+          grep -q '^CONFIG_NETFILTER_XT_TARGET_HL=y' out/.config
+          grep -q '^CONFIG_WIREGUARD=y' out/.config
+          grep -E '^CONFIG_KSU' out/.config
+          grep -q '^CONFIG_LTO_CLANG_FULL=y' out/.config
+          grep -q '^CONFIG_CFI_CLANG=y' out/.config
+          grep -E '^CONFIG_(SECCOMP|SECCOMP_FILTER)=' out/.config || true
+          if [ "${DISABLE_SECCOMP:-0}" = 1 ] && grep -q '^CONFIG_SECCOMP=y' out/.config; then echo "ERROR: CONFIG_SECCOMP is still on"; exit 1; fi
+          diff <(grep -E '^(CONFIG_|# CONFIG_)' ../config.txt | sort) <(grep -E '^(CONFIG_|# CONFIG_)' out/.config | sort) > ../config.diff || true
+          echo "--- config differences against the phone config:"
+          cat ../config.diff
+
+          # memory monitor (shows in the log how close the LTO link gets to the limit)
+          ( while sleep 120; do echo "[mem] $(free -m | awk 'NR==2{print "ram used "$3"/"$2" MB"} NR==3{print "swap used "$3"/"$2" MB"}' | tr '\n' ' ')"; done ) &
+          MONPID=$!
+          if ! make -j"$(nproc)" $MK KBUILD_BUILD_USER=PsychoAvy KBUILD_BUILD_HOST=github Image > ../build.log 2>&1; then
+            echo "BUILD FAILED, errors:"
+            grep -nE 'error|Error' ../build.log | head -60 || true
+            echo "last 60 lines:"; tail -60 ../build.log
+            exit 1
+          fi
+          kill $MONPID 2>/dev/null || true
+          tail -5 ../build.log
+
+          cd out
+          rel="$(cat include/config/kernel.release)"
+          echo "kernel.release = $rel"
+          # the real release (and so the module vermagic) must be unchanged
+          [ "$rel" = "$EXPECTED_RELEASE" ]
+          strings -n 8 arch/arm64/boot/Image | grep -m1 'Linux version 5.10'
+          strings arch/arm64/boot/Image | grep -qx "$EXPECTED_RELEASE SMP preempt mod_unload modversions aarch64"
+          if [ -n "${UNAME_FAKE_VERSION:-}" ]; then
+            strings arch/arm64/boot/Image | grep -qF "$UNAME_FAKE_VERSION"
+            echo "uname will show $UNAME_FAKE_VERSION to normal apps"
+          fi
+          echo "nomount symbols: $(grep -cE ' [tT] nm_' System.map)"
+          echo "ksu symbols: $(grep -ciE 'ksu' System.map)"
+          if [ "${ENABLE_SUSFS_LKM:-0}" = 1 ]; then
+            grep -E ' [A-Za-z] __stack_chk_guard$' System.map || echo "WARNING: __stack_chk_guard is not in System.map, the SUSFS LKM will fail to load"
+          fi
+          echo "susfs symbols (informational, 0 is expected: SUSFS comes from the LKM module): $(grep -ciE 'susfs' System.map)"
+          grep -iE 'FinaSU|KernelSU (version|tag)|Hook mode' ../../build.log || true
+          ls -la arch/arm64/boot/Image
+          EOF
+          chmod +x ci-build.sh
+
+      - name: Configure, build and verify (inside Debian container)
+        run: |
+          set -eux
+          docker run --rm \
+            -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
+            -e DISABLE_SECCOMP="$DISABLE_SECCOMP" \
+            -e UNAME_FAKE_VERSION="$UNAME_FAKE_VERSION" \
+            -e ENABLE_SUSFS_LKM="$ENABLE_SUSFS_LKM" \
+            -v "$PWD":/w \
+            -v "$HOME/clang":/clang:ro \
+            "$BUILD_IMAGE" bash /w/ci-build.sh
+
+      - name: Package AnyKernel3 zip
+        run: |
+          set -eux
+          test -f kernel/out/arch/arm64/boot/Image
+          git clone -q --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git .github README.md patch ramdisk
+          mkdir -p ramdisk patch
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 - POCO F5 (marble) GKI 5.10 kernel + NoMount + FinaSU
+          properties() { '
+          kernel.string=marble 5.10.269 GKI | NoMount + FinaSU | Android clang built
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=marble
+          device.name2=marblein
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          # GKI boot image (header v4): only the kernel is replaced, ramdisk untouched
+          split_boot;
+          flash_boot;
+          EOF
+          cp ../kernel/out/arch/arm64/boot/Image Image
+          zip -qr9 ../marble-nomount-finasu.zip .
+          cd ..
+          cp kernel/out/arch/arm64/boot/Image Image
+          sha256sum marble-nomount-finasu.zip Image | tee SHA256SUMS
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-kernel
+          if-no-files-found: warn
+          path: |
+            marble-nomount-finasu.zip
+            susfs-lkm-module.zip
+            Image
+            SHA256SUMS
+            build.log
+            config.diff
