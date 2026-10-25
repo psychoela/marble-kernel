@@ -1,68 +1,14 @@
-name: Remove adbd->adbroot binder rule from system_ext (EXT4)
-
-on:
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: "Release tag holding the system_ext image"
-        default: system-ext-backup
-      asset_name:
-        description: "Asset filename"
-        default: system_ext.img
-
-jobs:
-  patch:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install e2fsprogs
-        run: |
-          set -eux
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq e2fsprogs
-
-      - name: Download system_ext image from this repo's release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eux
-          gh release download "${{ inputs.release_tag }}" \
-            --repo "${{ github.repository }}" \
-            --pattern "${{ inputs.asset_name }}" \
-            --output system_ext.img
-          ls -la system_ext.img
-          file system_ext.img
-          cp system_ext.img system_ext_patched.img
-
-      - name: Mount read-only and show the rule before removal
-        run: |
-          set -eux
-          mkdir -p mnt
-          sudo mount -o loop,ro system_ext.img mnt
-          test -f mnt/etc/selinux/system_ext_sepolicy.cil
-          echo "--- line(s) to be removed ---"
-          grep -n '^(allow adbd adbroot (binder (call)))$' mnt/etc/selinux/system_ext_sepolicy.cil
-          sudo umount mnt
-
       - name: Mount read-write on the COPY and remove the rule
         run: |
           set -eux
           mkdir -p mnt
           sudo mount -o loop system_ext_patched.img mnt
-          sudo sed -i '/^(allow adbd adbroot (binder (call)))$/d' mnt/etc/selinux/system_ext_sepolicy.cil
+          # Edit OUTSIDE the mounted (tight) filesystem, on the runner's own disk,
+          # then overwrite the existing inode in place with cp (no temp file on the image).
+          cp mnt/etc/selinux/system_ext_sepolicy.cil cil_edit.tmp
+          sed -i '/^(allow adbd adbroot (binder (call)))$/d' cil_edit.tmp
+          sudo cp cil_edit.tmp mnt/etc/selinux/system_ext_sepolicy.cil
           echo "--- confirming it is gone ---"
           ! grep -q '^(allow adbd adbroot (binder (call)))$' mnt/etc/selinux/system_ext_sepolicy.cil
           sync
           sudo umount mnt
-
-      - name: Verify filesystem integrity after edit
-        run: |
-          set -eux
-          sudo e2fsck -fn system_ext_patched.img || true
-          ls -la system_ext_patched.img
-          file system_ext_patched.img
-
-      - name: Upload patched image
-        uses: actions/upload-artifact@v4
-        with:
-          name: system_ext_patched
-          path: system_ext_patched.img
