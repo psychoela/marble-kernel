@@ -1,0 +1,62 @@
+name: Remove adbd->adbroot binder rule from system_ext
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag holding system_ext.img"
+        default: system-ext-backup
+      asset_name:
+        description: "Asset filename"
+        default: system_ext_a.img
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install erofs-utils
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq erofs-utils
+
+      - name: Download system_ext image from this repo's release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          gh release download "${{ inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${{ inputs.asset_name }}" \
+            --output system_ext.img
+
+      - name: Extract
+        run: |
+          set -eux
+          fsck.erofs --extract=out system_ext.img
+          test -f out/etc/selinux/system_ext_sepolicy.cil
+          test -f out/etc/selinux/system_ext_file_contexts
+
+      - name: Show the rule before removal
+        run: |
+          grep -n '^(allow adbd adbroot (binder (call)))$' out/etc/selinux/system_ext_sepolicy.cil
+
+      - name: Remove the rule
+        run: |
+          set -eux
+          sed -i '/^(allow adbd adbroot (binder (call)))$/d' out/etc/selinux/system_ext_sepolicy.cil
+          # confirm it is gone, fail the job if not
+          ! grep -q '^(allow adbd adbroot (binder (call)))$' out/etc/selinux/system_ext_sepolicy.cil
+
+      - name: Repack to EROFS
+        run: |
+          set -eux
+          mkfs.erofs --file-contexts=out/etc/selinux/system_ext_file_contexts \
+            -zlz4hc system_ext_patched.img out
+          ls -la system_ext_patched.img
+
+      - name: Upload patched image
+        uses: actions/upload-artifact@v4
+        with:
+          name: system_ext_patched
+          path: system_ext_patched.img
