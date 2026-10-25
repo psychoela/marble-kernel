@@ -41,20 +41,27 @@ jobs:
           test -f mnt/etc/selinux/system_ext_sepolicy.cil
           echo "--- line(s) to be removed ---"
           grep -n '^(allow adbd adbroot (binder (call)))$' mnt/etc/selinux/system_ext_sepolicy.cil
-          echo "--- free space on the image itself (this is what's tight) ---"
           df -h mnt
           sudo umount mnt
 
-      - name: Mount read-write on the COPY and remove the rule
+      - name: Mount read-write on the COPY and remove the rule (no-space-safe)
         run: |
           set -eux
           mkdir -p mnt
           sudo mount -o loop system_ext_patched.img mnt
-          cp mnt/etc/selinux/system_ext_sepolicy.cil cil_edit.tmp
+          TARGET=mnt/etc/selinux/system_ext_sepolicy.cil
+          cp "$TARGET" cil_edit.tmp
           sed -i '/^(allow adbd adbroot (binder (call)))$/d' cil_edit.tmp
-          sudo cp cil_edit.tmp mnt/etc/selinux/system_ext_sepolicy.cil
+          OLD_SIZE=$(stat -c%s "$TARGET")
+          NEW_SIZE=$(stat -c%s cil_edit.tmp)
+          echo "old=$OLD_SIZE new=$NEW_SIZE"
+          # Write new (shorter) content into the file's EXISTING blocks, no truncate,
+          # so this needs zero extra space even on a 100%-full filesystem.
+          sudo dd if=cil_edit.tmp of="$TARGET" bs=1 conv=notrunc status=none
+          # Now shrink the file down to the new length - freeing blocks, never needs space.
+          sudo truncate -s "$NEW_SIZE" "$TARGET"
           echo "--- confirming it is gone ---"
-          ! grep -q '^(allow adbd adbroot (binder (call)))$' mnt/etc/selinux/system_ext_sepolicy.cil
+          ! grep -q '^(allow adbd adbroot (binder (call)))$' "$TARGET"
           sync
           sudo umount mnt
 
