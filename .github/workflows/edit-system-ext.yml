@@ -10,6 +10,10 @@ on:
         description: "Asset filename"
         default: system_ext.img
 
+# FIX: GITHUB_TOKEN is read-only by default -> 403 on `gh release create`
+permissions:
+  contents: write
+
 jobs:
   patch:
     runs-on: ubuntu-latest
@@ -55,10 +59,8 @@ jobs:
           OLD_SIZE=$(stat -c%s "$TARGET")
           NEW_SIZE=$(stat -c%s cil_edit.tmp)
           echo "old=$OLD_SIZE new=$NEW_SIZE"
-          # Write new (shorter) content into the file's EXISTING blocks, no truncate,
-          # so this needs zero extra space even on a 100%-full filesystem.
-          sudo dd if=cil_edit.tmp of="$TARGET" bs=1 conv=notrunc status=none
-          # Now shrink the file down to the new length - freeing blocks, never needs space.
+          # Overwrite existing blocks in place (no extra space needed), then shrink.
+          sudo dd if=cil_edit.tmp of="$TARGET" bs=4096 conv=notrunc status=none
           sudo truncate -s "$NEW_SIZE" "$TARGET"
           echo "--- confirming it is gone ---"
           ! grep -q '^(allow adbd adbroot (binder (call)))$' "$TARGET"
@@ -68,7 +70,7 @@ jobs:
       - name: Verify filesystem integrity after edit
         run: |
           set -eux
-          sudo e2fsck -fn system_ext_patched.img || true
+          sudo e2fsck -fn system_ext_patched.img
           ls -la system_ext_patched.img
           file system_ext_patched.img
 
@@ -82,3 +84,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "system_ext patched (adbroot rule removed)" \
             --notes "Built from run ${{ github.run_id }}"
+            
