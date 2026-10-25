@@ -72,8 +72,13 @@ jobs:
           ls -la system_ext_patched.img
           file system_ext_patched.img
 
-      - name: Upload patched image
-        uses: actions/upload-artifact@v4
-        with:
-          name: system_ext_patched
-          path: system_ext_patched.img
+      - name: Upload patched image to a new release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          gh release create "system-ext-patched-${{ github.run_id }}" \
+            system_ext_patched.img \
+            --repo "${{ github.repository }}" \
+            --title "system_ext patched (adbroot rule removed)" \
+            --notes "Built from run ${{ github.run_id }}"
