@@ -266,7 +266,7 @@ jobs:
           du -sh "$HOME/clang"
 
       - name: Download Android clang from Neebe3289/aosp-clang (r596125 pinned, or the newest release)
-        if: ${{ inputs.clang_choice == 'android-r596125' || inputs.clang_choice == 'android-latest-github' }}
+        if: ${{ inputs.clang_choice == 'android-r596125' || inputs.clang_choice == 'android-latest-23+' }}
         env:
           GH_TOKEN: ${{ github.token }}
           CLANG_CHOICE: ${{ inputs.clang_choice }}
