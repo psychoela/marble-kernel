@@ -67,6 +67,9 @@ env:
   # a WARNING (vendor modules in the ROM may refuse to load a different release). Does not fail the build.
   PHONE_BASE_VERSION: "5.10.269"
   BUILD_IMAGE: debian:bookworm-slim
+  # Alchemist LLVM is built against a newer glibc (needs GLIBC_2.38, Debian bookworm only has 2.36),
+  # so the Alchemist choices build inside Ubuntu 24.04 (glibc 2.39) instead.
+  BUILD_IMAGE_ALCHEMIST: ubuntu:24.04
   # Version that apps see in `uname -r`, /proc/version and /proc/sys/kernel/osrelease.
   # DISPLAY ONLY: the kernel itself stays 5.10.269. kernel.release, LINUX_VERSION_CODE and the
   # module vermagic are NOT changed, so the vendor modules and FinaSU build and load as before.
@@ -767,9 +770,14 @@ jobs:
           restore-keys: |
             ccache-marble-
 
-      - name: Configure, build and verify (inside Debian container)
+      - name: Configure, build and verify (inside Debian/Ubuntu container)
+        env:
+          CLANG_CHOICE: ${{ inputs.clang_choice }}
         run: |
           set -eux
+          IMG="$BUILD_IMAGE"
+          case "$CLANG_CHOICE" in alchemist-*) IMG="$BUILD_IMAGE_ALCHEMIST" ;; esac
+          echo "build image: $IMG"
           docker run --rm \
             -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
             -e LOCALVERSION_SUFFIX="$LOCALVERSION_SUFFIX" \
@@ -781,7 +789,7 @@ jobs:
             -e ENABLE_SUSFS_LKM="$ENABLE_SUSFS_LKM" \
             -v "$PWD":/w \
             -v "$HOME/clang":/clang:ro \
-            "$BUILD_IMAGE" bash /w/ci-build.sh
+            "$IMG" bash /w/ci-build.sh
 
       - name: Save ccache
         if: always()
