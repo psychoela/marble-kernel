@@ -28,7 +28,7 @@ env:
   # Your own kernel source (fork of Evolution-X kernel_xiaomi_sm8450, branch cnb, 5.10.269).
   # KERNEL_SHA "" = tip of KERNEL_BRANCH (the commit is printed in the log). To pin, put a commit SHA here.
   KERNEL_REPO: https://github.com/psychoela/marble-kernel-x
-  KERNEL_BRANCH: test-revert-walt
+  KERNEL_BRANCH: cnb
   KERNEL_SHA: ""
   # NoMount (maxsteeel/nomount). NOMOUNT_BRANCH "latest" = newest GitHub release tag (auto-detected in the
   # "Resolve latest versions" step; falls back to the newest tag, then to master if there is no release).
