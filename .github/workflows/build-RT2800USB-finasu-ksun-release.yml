@@ -1,4 +1,4 @@
-name: Build marble kernel from psychoela/marble-kernel-x (RT2800USB + NoMount + FinaSU or KernelSU-Next, real uname, Android/LLVM clang, Debian container)
+name: Build marble kernel from psychoela/marble-kernel-x (NoMount + FinaSU or KernelSU-Next, real uname, Android/LLVM clang, Debian container)
 
 on:
   workflow_dispatch:
@@ -791,6 +791,30 @@ jobs:
           echo "susfs symbols (informational, 0 is expected: SUSFS comes from the LKM module you installed): $(grep -ciE 'susfs' System.map)"
           grep -iE 'FinaSU|KernelSU|Hook mode' ../../build.log | head -20 || true
           ls -la arch/arm64/boot/Image
+
+          # Build the USB WiFi adapter drivers as .ko modules (Image above only builds the kernel
+          # itself, not loadable modules). Non-fatal: a missing/unsupported driver on this tree
+          # should not fail the whole kernel build, since the Image is already done at this point.
+          cd /w/kernel
+          echo "--- building kernel modules (mt7601u, rt2800usb, and the rest)"
+          if make -j"$(nproc)" $MK modules > ../modules-build.log 2>&1; then
+            echo "modules build OK"
+          else
+            echo "WARNING: 'make modules' failed, see modules-build.log. Image is still fine."
+            tail -60 ../modules-build.log || true
+          fi
+          mkdir -p /w/wifi-modules
+          find out -name '*.ko' \( \
+            -iname 'mt7601u.ko' -o -iname 'rt2x00*.ko' -o -iname 'rt2800*.ko' -o -iname 'rt73usb.ko' \
+            -o -iname 'ath9k_htc.ko' -o -iname 'carl9170.ko' -o -iname 'rtl8xxxu.ko' \
+            -o -iname 'rtl8192cu.ko' -o -iname 'rtl8187.ko' -o -iname 'mac80211.ko' -o -iname 'cfg80211.ko' \
+          \) -exec cp -v {} /w/wifi-modules/ \;
+          echo "--- .ko files collected:"
+          ls -la /w/wifi-modules/ || echo "none found (see modules-build.log / WARNING lines above)"
+          for ko in /w/wifi-modules/*.ko; do
+            [ -e "$ko" ] || break
+            echo "-- $ko"; modinfo "$ko" 2>/dev/null | grep -E '^(filename|vermagic|depends)' || true
+          done
           EOF
           chmod +x ci-build.sh
 
@@ -874,6 +898,14 @@ jobs:
           zip -qr9 ../marble-nomount-finasu.zip .
           cd ..
           cp kernel/out/arch/arm64/boot/Image Image
+          # USB WiFi adapter .ko modules (mt7601u, rt2800usb, etc.), built as a non-fatal extra
+          # step above. Zipped on their own since they go in /data/adb/modules/..., not AnyKernel3.
+          if ls wifi-modules/*.ko >/dev/null 2>&1; then
+            zip -qr9 wifi-modules.zip wifi-modules
+          else
+            echo "no .ko files were built, skipping wifi-modules.zip"
+          fi
+          sha256sum marble-nomount-finasu.zip Image wifi-modules.zip 2>/dev/null | tee SHA256SUMS || \
           sha256sum marble-nomount-finasu.zip Image | tee SHA256SUMS
 
       - name: Publish GitHub Release
@@ -894,6 +926,7 @@ jobs:
             echo '```'
           } > release-notes.md
           FILES="marble-nomount-finasu.zip Image SHA256SUMS"
+          [ -f wifi-modules.zip ] && FILES="$FILES wifi-modules.zip"
           gh release create "$TAG" $FILES \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
@@ -912,6 +945,8 @@ jobs:
           path: |
             marble-nomount-finasu.zip
             Image
+            wifi-modules.zip
             SHA256SUMS
             build.log
+            modules-build.log
             config.diff
