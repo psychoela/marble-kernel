@@ -1,4 +1,4 @@
-name: Build marble kernel from psychoela/marble-kernel-x (NoMount + Fget + FinaSU or KernelSU-Next, real uname, Android/LLVM clang, Debian container)
+name: Build marble kernel from psychoela/marble-kernel-x (NoMount + FinaSU or KernelSU-Next, real uname, Android/LLVM clang, Debian container)
 
 on:
   workflow_dispatch:
@@ -86,14 +86,14 @@ env:
   # which the prebuilt susfs_guard_lkm .ko needs. This workflow no longer builds the module ZIP.
   # Set to "0" if you stop using the SUSFS LKM.
   ENABLE_SUSFS_LKM: "1"
-  # fgetpriority (aerath-stuff/fgetpriority, branch lkm): small LKM that filters getpriority syscalls,
+  # fgetpriority (aerath-stuff/fgetpriority, default branch): small LKM that filters getpriority syscalls,
   # a helper for HMA/HMAL/HMA-OSS. It is built as a .ko against THIS kernel (same config, clang and
   # vermagic) and shipped next to the zip as fgetpriority.ko. It is NOT built into the Image: install it
   # after boot with the repo's module/installer. A failure here only prints a WARNING, the kernel still ships.
-  # FGETPRIORITY_SHA "" = tip of FGETPRIORITY_BRANCH. Set ENABLE_FGETPRIORITY to "0" to skip it.
+  # FGETPRIORITY_BRANCH "HEAD" = the repo's default branch. FGETPRIORITY_SHA "" = tip of that. Set ENABLE_FGETPRIORITY to "0" to skip it.
   ENABLE_FGETPRIORITY: "1"
   FGETPRIORITY_REPO: https://github.com/aerath-stuff/fgetpriority
-  FGETPRIORITY_BRANCH: lkm
+  FGETPRIORITY_BRANCH: HEAD
   FGETPRIORITY_SHA: ""
 
 jobs:
