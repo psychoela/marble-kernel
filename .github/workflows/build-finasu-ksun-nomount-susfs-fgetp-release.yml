@@ -86,14 +86,14 @@ env:
   # which the prebuilt susfs_guard_lkm .ko needs. This workflow no longer builds the module ZIP.
   # Set to "0" if you stop using the SUSFS LKM.
   ENABLE_SUSFS_LKM: "1"
-  # fgetpriority (aerath-stuff/fgetpriority, default branch): small LKM that filters getpriority syscalls,
+  # fgetpriority (aerath-stuff/fgetpriority, branch lkm, falls back to the default branch): small LKM that filters getpriority syscalls,
   # a helper for HMA/HMAL/HMA-OSS. It is built as a .ko against THIS kernel (same config, clang and
   # vermagic) and shipped next to the zip as fgetpriority.ko. It is NOT built into the Image: install it
   # after boot with the repo's module/installer. A failure here only prints a WARNING, the kernel still ships.
-  # FGETPRIORITY_BRANCH "HEAD" = the repo's default branch. FGETPRIORITY_SHA "" = tip of that. Set ENABLE_FGETPRIORITY to "0" to skip it.
+  # FGETPRIORITY_SHA "" = tip of FGETPRIORITY_BRANCH (if that branch is missing, the default branch is used). Set ENABLE_FGETPRIORITY to "0" to skip it.
   ENABLE_FGETPRIORITY: "1"
   FGETPRIORITY_REPO: https://github.com/aerath-stuff/fgetpriority
-  FGETPRIORITY_BRANCH: HEAD
+  FGETPRIORITY_BRANCH: lkm
   FGETPRIORITY_SHA: ""
 
 jobs:
@@ -422,8 +422,11 @@ jobs:
           git -C nomount log -1 --format='nomount %H %s'
           ls -la nomount/kernel/src
           if [ "${ENABLE_FGETPRIORITY:-0}" = 1 ]; then
-            fetch_sha "$FGETPRIORITY_REPO" "${FGETPRIORITY_SHA:-$FGETPRIORITY_BRANCH}" fgetpriority \
-              || echo "WARNING: could not fetch fgetpriority"
+            if ! fetch_sha "$FGETPRIORITY_REPO" "${FGETPRIORITY_SHA:-$FGETPRIORITY_BRANCH}" fgetpriority; then
+              echo "WARNING: fgetpriority ref '${FGETPRIORITY_SHA:-$FGETPRIORITY_BRANCH}' not found, using default branch"
+              rm -rf fgetpriority
+              fetch_sha "$FGETPRIORITY_REPO" HEAD fgetpriority || echo "WARNING: could not fetch fgetpriority"
+            fi
             git -C fgetpriority log -1 --format='fgetpriority %H %s' || true
             find fgetpriority -maxdepth 2 -not -path '*/.git*' | head -40 || true
           fi
@@ -780,11 +783,20 @@ jobs:
             echo "== fgetpriority LKM"
             cd /w/kernel
             FGP_OK=0
-            SRC="$(grep -rlE '^[[:space:]]*obj-m' /w/fgetpriority --include=Makefile --include=Kbuild 2>/dev/null | head -n1 | xargs -r dirname)"
+            SRC="$(grep -rlE '^[[:space:]]*obj-(m|\$\(CONFIG_[A-Za-z0-9_]+\))' /w/fgetpriority --include=Makefile --include=Kbuild 2>/dev/null | head -n1 | xargs -r dirname)"
             echo "fgetpriority module source dir: ${SRC:-NOT FOUND}"
+            # Kconfig-style Makefile (obj-$(CONFIG_X) += ...): build it as a module with CONFIG_X=m
+            FGP_CFG=""
+            if [ -n "$SRC" ]; then
+              FGP_CFG="$(grep -ohE 'obj-\$\(CONFIG_[A-Za-z0-9_]+\)' "$SRC"/Makefile "$SRC"/Kbuild 2>/dev/null | head -n1 | sed -E 's/.*\((CONFIG_[A-Za-z0-9_]+)\).*/\1/')"
+              echo "fgetpriority config symbol: ${FGP_CFG:-none (plain obj-m)}"
+            fi
+            for f in /w/fgetpriority/kernel/Makefile /w/fgetpriority/kernel/Kconfig; do
+              [ -f "$f" ] && { echo "--- $f"; head -n 60 "$f"; } || true
+            done
             if [ -n "$SRC" ] \
                && make -j"$(nproc)" $MK modules_prepare \
-               && make -j"$(nproc)" $MK KBUILD_MODPOST_WARN=1 M="$SRC" modules; then
+               && make -j"$(nproc)" $MK KBUILD_MODPOST_WARN=1 ${FGP_CFG:+$FGP_CFG=m} M="$SRC" modules; then
               KO="$(find "$SRC" -name '*.ko' | head -n1)"
               if [ -n "$KO" ]; then
                 cp "$KO" /w/fgetpriority.ko
