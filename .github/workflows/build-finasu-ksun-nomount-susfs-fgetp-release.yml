@@ -1,4 +1,4 @@
-name: Build marble kernel from psychoela/marble-kernel-x (NoMount + FinaSU or KernelSU-Next, real uname, Android/LLVM clang, Debian container)
+name: Build marble kernel from psychoela/marble-kernel-x (NoMount + Fget + FinaSU or KernelSU-Next, real uname, Android/LLVM clang, Debian container)
 
 on:
   workflow_dispatch:
