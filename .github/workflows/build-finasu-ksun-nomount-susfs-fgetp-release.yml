@@ -852,8 +852,12 @@ jobs:
           key: ccache-marble-${{ github.run_id }}
 
       - name: Package AnyKernel3 zip
+        env:
+          ROOT_CHOICE: ${{ inputs.root_choice }}
         run: |
           set -eux
+          if [ "$ROOT_CHOICE" = kernelsu-next ]; then ZIP_NAME=marble-nomount-ksun.zip; else ZIP_NAME=marble-nomount-finasu.zip; fi
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
           test -f kernel/out/arch/arm64/boot/Image
           git clone -q --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
           cd ak3
@@ -890,34 +894,130 @@ jobs:
           flash_boot;
           EOF
           cp ../kernel/out/arch/arm64/boot/Image Image
-          zip -qr9 ../marble-nomount-finasu.zip .
+          zip -qr9 "../$ZIP_NAME" .
           cd ..
           cp kernel/out/arch/arm64/boot/Image Image
-          sha256sum marble-nomount-finasu.zip Image $( [ -f fgetpriority.ko ] && echo fgetpriority.ko ) | tee SHA256SUMS
+          sha256sum "$ZIP_NAME" Image $( [ -f fgetpriority.ko ] && echo fgetpriority.ko ) | tee SHA256SUMS
 
       - name: Publish GitHub Release
         if: success() && inputs.publish_release
         env:
           GH_TOKEN: ${{ github.token }}
+          ROOT_CHOICE: ${{ inputs.root_choice }}
+          CLANG_CHOICE: ${{ inputs.clang_choice }}
         run: |
-          set -eux
+          set -eu
           TAG="build-${{ github.run_number }}"
+          RUN_NO="${{ github.run_number }}"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          CFG=kernel/out/.config
+          ZIP="$ZIP_NAME"
+
+          # ---------- collect every detail of this build ----------
           REL="$(cat kernel/out/include/config/kernel.release)"
+          KVER="$(head -n 10 kernel/Makefile | awk '/^VERSION *=/{v=$3} /^PATCHLEVEL *=/{p=$3} /^SUBLEVEL *=/{s=$3} END{print v"."p"."s}')"
+
+          KSHA="$(git -C kernel rev-parse HEAD 2>/dev/null || echo unknown)"
+          KSHORT="$(echo "$KSHA" | cut -c1-7)"
+          KSUBJ="$(git -C kernel log -1 --format=%s 2>/dev/null || true)"
+
+          RSHA="$(git -C "kernel/$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+          RSHORT="$(echo "$RSHA" | cut -c1-7)"
+          RDESC="$(git -C "kernel/$ROOT_DIR" describe --tags --always 2>/dev/null || echo unknown)"
+          RCOUNT="$(git -C "kernel/$ROOT_DIR" rev-list --count HEAD 2>/dev/null || echo '?')"
+          ROOT_URL="${ROOT_REPO%.git}"
+
+          NSHA="$(git -C nomount rev-parse HEAD 2>/dev/null || echo unknown)"
+          NSHORT="$(echo "$NSHA" | cut -c1-7)"
+
+          CLANG_VER="$("$HOME/clang/bin/clang" --version 2>/dev/null | head -n1 || true)"
+          [ -n "$CLANG_VER" ] || CLANG_VER="$CLANG_CHOICE"
+
+          if   grep -q '^CONFIG_LTO_CLANG_FULL=y' "$CFG"; then LTO="Full LTO"
+          elif grep -q '^CONFIG_LTO_CLANG_THIN=y' "$CFG"; then LTO="ThinLTO"
+          else LTO="LTO off"; fi
+          if grep -q '^CONFIG_CFI_CLANG=y' "$CFG"; then CFI="CFI on"; else CFI="CFI off"; fi
+
+          KSU_OPTS="$(grep -E '^CONFIG_KSU[A-Z0-9_]*=y' "$CFG" | sed 's/^CONFIG_//; s/=y$//' | paste -sd, - | sed 's/,/, /g')"
+          yn() { if grep -q "^$1=y" "$CFG"; then echo "on"; else echo "off"; fi; }
+
+          if [ "$DISABLE_SECCOMP" = 1 ]; then SECCOMP="disabled (WARNING: may bootloop)"; else SECCOMP="stock (enabled)"; fi
+          if [ -n "$UNAME_FAKE_VERSION" ]; then UNAME_TXT="shows \`$UNAME_FAKE_VERSION\` to normal apps (real: \`$REL\`)"; else UNAME_TXT="real version (spoof off)"; fi
+          if [ "$ENABLE_SUSFS_LKM" = 1 ]; then SUSFS_TXT="LKM support on (\`__stack_chk_guard\` exported). Load your own susfs_guard_lkm module"; else SUSFS_TXT="off"; fi
+
+          if [ -f fgetpriority.ko ]; then
+            FGSHA="$(git -C fgetpriority rev-parse --short HEAD 2>/dev/null || echo '?')"
+            FGVM="$(strings -n 8 fgetpriority.ko | grep -m1 '^vermagic=' | cut -d= -f2- || true)"
+            FGP_TXT="built · \`$FGSHA\` · vermagic \`${FGVM:-?}\` (install after boot, not inside the Image)"
+          else
+            FGP_TXT="not built"
+          fi
+
+          if [ -s finasu-manager.hash ]; then
+            CERT_TXT="pinned, manager cert SHA-256 \`$(cat finasu-manager.hash)\` (use the FinaSU manager of tag \`$ROOT_REF\`)"
+          else
+            CERT_TXT="default manager certificate (install the normal KernelSU-Next manager, try the non-spoofed APK first)"
+          fi
+
+          sz() { numfmt --to=iec --suffix=B "$(stat -c%s "$1")"; }
+          BUILD_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
+
+          # ---------- write the release notes ----------
           {
-            echo "Kernel release: $REL"
+            echo "# marble ${KVER} · NoMount + ${ROOT_NAME} · run ${RUN_NO}"
             echo
-            echo "$ROOT_NAME: $(git -C "kernel/$ROOT_DIR" describe --tags --always) ($(git -C "kernel/$ROOT_DIR" rev-parse --short HEAD))"
+            echo "\`${REL}\`"
+            echo
+            echo "- **Root:** ${ROOT_NAME} \`${RDESC}\` ([\`${RSHORT}\`](${ROOT_URL}/commit/${RSHA}), ${RCOUNT} commits) · ref \`${ROOT_REF}\`"
+            echo "- **NoMount:** built in (install the NoMount module after flashing) · ref \`${NOMOUNT_BRANCH}\` · [\`${NSHORT}\`](${NOMOUNT_REPO}/commit/${NSHA})"
+            echo "- **Clang:** \`${CLANG_VER}\` · ${LTO} · ${CFI} · choice \`${CLANG_CHOICE}\`"
+            echo "- **Commit:** [\`${KSHORT}\`](${KERNEL_REPO}/commit/${KSHA}) · ${KSUBJ}"
+            echo "- **Base:** [psychoela/marble-kernel-x](${KERNEL_REPO}) (Evolution-X sm8450 fork), branch \`${KERNEL_BRANCH}\` · [source](${KERNEL_REPO}/tree/${KSHA})"
+            echo
+            echo "> Flash in recovery (or with a kernel flasher). Back up boot first."
+            echo
+            echo "## Details"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Device | POCO F5 / Redmi Note 12 Turbo (marble, marblein) |"
+            echo "| Kernel base | ${KVER} (phone runs ${PHONE_BASE_VERSION}) |"
+            echo "| Root options | ${KSU_OPTS:-none} |"
+            echo "| Manager | ${CERT_TXT} |"
+            echo "| SUSFS | ${SUSFS_TXT} |"
+            echo "| fgetpriority | ${FGP_TXT} |"
+            echo "| Seccomp | ${SECCOMP} |"
+            echo "| uname | ${UNAME_TXT} |"
+            echo "| Build env | ${BUILD_IMAGE} (Alchemist choices: ${BUILD_IMAGE_ALCHEMIST}) |"
+            echo "| Built by | ${GITHUB_ACTOR} as PsychoAvy@github · ${BUILD_DATE} |"
+            echo "| Workflow run | [#${RUN_NO}](${RUN_URL}) |"
+            echo
+            echo "## Extras in this build"
+            echo
+            echo "- TCP BBR: $(yn CONFIG_TCP_CONG_BBR) · Westwood: $(yn CONFIG_TCP_CONG_WESTWOOD) · fq: $(yn CONFIG_NET_SCH_FQ)"
+            echo "- fq_codel: $(yn CONFIG_NET_SCH_FQ_CODEL) · cake: $(yn CONFIG_NET_SCH_CAKE)"
+            echo "- TTL/HL iptables target (hotspot TTL): $(yn CONFIG_NETFILTER_XT_TARGET_HL) · WireGuard: $(yn CONFIG_WIREGUARD)"
+            echo "- NoMount: $(yn CONFIG_NOMOUNT) · ${ROOT_NAME}: $(yn CONFIG_KSU)"
+            echo
+            echo "## Files"
+            echo
+            echo "- \`${ZIP}\` (${ZIP_SZ:-$(sz "$ZIP")}): AnyKernel3 zip, flash this"
+            echo "- \`Image\` ($(sz Image)): raw kernel Image"
+            if [ -f fgetpriority.ko ]; then echo "- \`fgetpriority.ko\` ($(sz fgetpriority.ko)): optional LKM"; fi
+            echo "- \`SHA256SUMS\`"
             echo
             echo '```'
             cat SHA256SUMS
             echo '```'
           } > release-notes.md
-          FILES="marble-nomount-finasu.zip Image SHA256SUMS"
+          cat release-notes.md
+
+          FILES="$ZIP Image SHA256SUMS"
           if [ -f fgetpriority.ko ]; then FILES="$FILES fgetpriority.ko"; fi
           gh release create "$TAG" $FILES \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "marble kernel $TAG" \
+            --title "marble ${KVER} ${ROOT_NAME} · run ${RUN_NO}" \
             --notes-file release-notes.md \
             --prerelease
 
@@ -930,9 +1030,10 @@ jobs:
           retention-days: 1
           if-no-files-found: warn
           path: |
-            marble-nomount-finasu.zip
+            marble-nomount-*.zip
             Image
             fgetpriority.ko
             SHA256SUMS
+            release-notes.md
             build.log
             config.diff
