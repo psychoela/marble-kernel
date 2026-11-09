@@ -103,15 +103,31 @@ jobs:
           git -C "$KP/vendor/xiaomi/sm8450-kernel" log --oneline -2
           ls "$KP/vendor/xiaomi/sm8450-kernel/drivers/kernelsu" | head -3
 
-      - name: Fix KernelSU-Next include path (uapi/app_profile.h not found)
+      - name: Fix KernelSU-Next include/uapi (symlink does not resolve inside Kleaf)
         working-directory: /mnt/work/ws
         run: |
+          # Kbuild already adds -I drivers/kernelsu/include, so "uapi/app_profile.h" must be at
+          # drivers/kernelsu/include/uapi/. That entry is a symlink in the repo; it is either dangling
+          # (target not vendored) or not followed by Kleaf's sandbox. Replace it with a real directory.
           KSU="$KP/vendor/xiaomi/sm8450-kernel/drivers/kernelsu"
-          test -f "$KSU/uapi/app_profile.h" || { echo "uapi/app_profile.h missing in vendored KSU-Next, re-import the full v3.4.2 tree"; ls -R "$KSU" | head -40; exit 1; }
-          if ! grep -q 'KSU_INCLUDE_FIX' "$KSU/Kbuild"; then
-            printf '\n# KSU_INCLUDE_FIX: headers include each other as "uapi/..." and "policy/..."\nccflags-y += -I$(srctree)/$(src)\n' >> "$KSU/Kbuild"
+          U="$KSU/include/uapi"
+          ls -ld "$U"; readlink "$U" || true
+          if [ -L "$U" ] && [ -f "$U/app_profile.h" ]; then
+            echo "symlink resolves, replacing it with a real copy"
+            cp -rL "$U" /tmp/uapi_copy
+            rm -f "$U"; mv /tmp/uapi_copy "$U"
+          elif [ ! -f "$U/app_profile.h" ]; then
+            echo "uapi headers missing, fetching them from upstream KernelSU-Next"
+            rm -rf "$U" /tmp/ksun
+            git clone --depth 1 --branch v3.4.2 https://github.com/KernelSU-Next/KernelSU-Next /tmp/ksun \
+              || git clone --depth 1 https://github.com/KernelSU-Next/KernelSU-Next /tmp/ksun
+            H=$(find /tmp/ksun -path '*/uapi/app_profile.h' | head -1)
+            test -n "$H" || { echo "app_profile.h not found upstream"; find /tmp/ksun -maxdepth 3 -type d | head -40; exit 1; }
+            mkdir -p "$U"
+            cp -r "$(dirname "$H")"/. "$U"/
           fi
-          tail -4 "$KSU/Kbuild"
+          test -f "$U/app_profile.h" && echo "OK: $U/app_profile.h present"
+          ls -la "$U"
 
       - name: Build kernel with Kleaf
         working-directory: /mnt/work/ws
