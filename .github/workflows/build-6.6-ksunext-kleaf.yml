@@ -1,0 +1,173 @@
+# Build the marble (POCO F5 / Redmi Note 12 Turbo) 6.6 kernel with KernelSU Next
+# and package the resulting Image as an AnyKernel3 zip.
+#
+# Lives in psychoela/marble-kernel (the build repo) as .github/workflows/build-6.6-ksunext-kleaf.yml.
+# It builds the kernel source from psychoela/marble-kernel-x, branch cnb-6.6, which already has
+# KernelSU Next built in (drivers/kernelsu + CONFIG_KSU=y), so no root injection step is needed here.
+# Run it from Actions -> "Build marble 6.6 kernel (Kleaf, KernelSU Next built in)" -> Run workflow.
+#
+# STATUS: UNTESTED. Written from reading the repos, not from a successful run.
+# Places most likely to need adjusting are marked with "CHECK".
+
+name: Build marble 6.6 kernel (Kleaf, KernelSU Next built in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bazel_target:
+        description: "Kleaf dist target that produces Image"
+        default: "//vendor/xiaomi/sm8450-kernel:kernel_aarch64_dist"   # CHECK: confirm name
+      modules_ref:
+        description: "Branch of cupid-development modules/build repos"
+        default: "lineage-24.0-6.6"
+      lto:
+        description: "Bazel --lto value (empty = Kleaf default, thin/none = faster)"
+        default: ""
+
+env:
+  KP: kernel/platform/kernel-6.6
+  # Kernel source (Evolution X cnb-6.6 + KernelSU Next commit). Pin a SHA here to build an exact commit.
+  KERNEL_REPO: psychoela/marble-kernel-x
+  KERNEL_BRANCH: cnb-6.6
+
+jobs:
+  build:
+    # 22.04 on purpose: 24.04 restricts unprivileged user namespaces, which breaks Bazel's sandbox.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space and set up /mnt
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo mkdir -p /mnt/work /mnt/bazel
+          sudo chown -R "$USER" /mnt/work /mnt/bazel
+          df -h / /mnt
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl zip unzip rsync python3 xz-utils lz4 bc
+
+      - name: Install repo tool
+        run: |
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name  "ci"
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global color.ui false
+
+      - name: Build a minimal manifest (kernel platform + marble kernel repos only)
+        working-directory: /mnt/work
+        run: |
+          # Evolution X's manifest carries the Kleaf/kernel-platform snippet for 6.6.
+          git clone --depth 1 -b cnb https://github.com/Evolution-X/manifest evox-manifest
+
+          mkdir -p mf/snippets
+          cp evox-manifest/snippets/kernel-6.6.xml mf/snippets/kernel-6.6.xml
+          cat > mf/default.xml <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="aosp"   fetch="https://android.googlesource.com/" />
+            <remote name="github" fetch="https://github.com/" />
+            <default revision="main" remote="aosp" sync-j="4" />
+
+            <include name="snippets/kernel-6.6.xml" />
+
+            <!-- kernel source -->
+            <project name="${{ env.KERNEL_REPO }}" path="kernel/platform/kernel-6.6/vendor/xiaomi/sm8450-kernel" remote="github" revision="${{ env.KERNEL_BRANCH }}" />
+
+            <project name="Evolution-X-Devices/kernel_xiaomi_sm8450-devicetrees" path="kernel/platform/kernel-6.6/vendor/xiaomi/sm8450-devicetrees" remote="github" revision="cnb-6.6" />
+            <project name="cupid-development/android_kernel_xiaomi_sm8450-modules-6.6" path="kernel/platform/kernel-6.6/vendor/xiaomi/sm8450-modules" remote="github" revision="${{ inputs.modules_ref }}" />
+            <project name="cupid-development/android_kernel_xiaomi_sm8450-build-6.6" path="kernel/platform/kernel-6.6/vendor/xiaomi/sm8450-build" remote="github" revision="${{ inputs.modules_ref }}" />
+          </manifest>
+          EOF
+
+          cd mf
+          git init -q -b main
+          git add -A
+          git commit -q -m manifest
+
+      - name: Sync sources
+        working-directory: /mnt/work
+        run: |
+          mkdir -p ws && cd ws
+          repo init --no-repo-verify -u file:///mnt/work/mf -b main -m default.xml
+          repo sync -c -j4 --no-tags --no-clone-bundle --fail-fast
+          ls "$KP"
+          git -C "$KP/vendor/xiaomi/sm8450-kernel" log --oneline -2
+          ls "$KP/vendor/xiaomi/sm8450-kernel/drivers/kernelsu" | head -3
+
+      - name: Build kernel with Kleaf
+        working-directory: /mnt/work/ws
+        run: |
+          cd "$KP"
+          LTO=""
+          if [ -n "${{ inputs.lto }}" ]; then LTO="--lto=${{ inputs.lto }}"; fi
+          # CHECK: some Kleaf versions want --config=local or extra flags on CI runners.
+          tools/bazel --output_user_root=/mnt/bazel run $LTO \
+            "${{ inputs.bazel_target }}" -- --dist_dir=/mnt/work/dist
+          ls -la /mnt/work/dist | head -40
+
+      - name: Package AnyKernel3 zip
+        run: |
+          IMG=$(find /mnt/work/dist -maxdepth 2 -name Image -type f | head -1)
+          test -n "$IMG" || { echo "Image not found in dist"; ls -R /mnt/work/dist | head -50; exit 1; }
+
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3 /mnt/work/ak3
+          cd /mnt/work/ak3
+          rm -rf .git .github README.md modules patch ramdisk
+          cp "$IMG" Image
+
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=marble 6.6 + KernelSU Next
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=marble
+          device.name2=
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          # CHECK: partition layout. GKI + boot header v4 normally means "boot" holds the kernel.
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          EOF
+
+          DATE=$(date +%Y%m%d-%H%M)
+          zip -r9 "/mnt/work/marble-6.6-KSUNext-$DATE.zip" . -x '*.git*'
+          ls -la /mnt/work/*.zip
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-6.6-KSUNext
+          path: /mnt/work/marble-6.6-KSUNext-*.zip
+          if-no-files-found: error
+
+      - name: Upload raw Image and config
+        uses: actions/upload-artifact@v4
+        with:
+          name: marble-6.6-Image
+          path: |
+            /mnt/work/dist/Image
+            /mnt/work/dist/.config
+          if-no-files-found: warn
