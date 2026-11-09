@@ -135,6 +135,17 @@ jobs:
           done
           ls -la "$U"
 
+      - name: Hardcode build user/host in scripts/mkcompile_h
+        working-directory: /mnt/work/ws
+        run: |
+          # Kleaf forces KBUILD_BUILD_USER=kleaf / HOST=build-host inside its sandbox, so env vars
+          # and action_env are ignored. Patch the script that writes the version string instead.
+          F="$KP/vendor/xiaomi/sm8450-kernel/scripts/mkcompile_h"
+          sed -i -E "s|^([[:space:]]*)LINUX_COMPILE_BY=.*|\1LINUX_COMPILE_BY=${BUILD_USER}|; s|^([[:space:]]*)LINUX_COMPILE_HOST=.*|\1LINUX_COMPILE_HOST=${BUILD_HOST}|" "$F"
+          grep -n 'LINUX_COMPILE_BY=\|LINUX_COMPILE_HOST=' "$F"
+          grep -q "LINUX_COMPILE_BY=${BUILD_USER}" "$F" && grep -q "LINUX_COMPILE_HOST=${BUILD_HOST}" "$F" \
+            || { echo "mkcompile_h patch did not apply"; cat "$F" | head -40; exit 1; }
+
       - name: Build kernel with Kleaf
         working-directory: /mnt/work/ws
         run: |
