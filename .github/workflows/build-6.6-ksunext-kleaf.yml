@@ -119,14 +119,20 @@ jobs:
           elif [ ! -f "$U/app_profile.h" ]; then
             echo "uapi headers missing, fetching them from upstream KernelSU-Next"
             rm -rf "$U" /tmp/ksun
-            git clone --depth 1 --branch v3.4.2 https://github.com/KernelSU-Next/KernelSU-Next /tmp/ksun \
-              || git clone --depth 1 https://github.com/KernelSU-Next/KernelSU-Next /tmp/ksun
+            # The vendored driver sources are newer than the v3.4.2 tag (they use PREINIT and
+            # LOOKUP_SYMBOLS), so take the headers from the upstream default branch, not the tag.
+            git clone --depth 1 https://github.com/KernelSU-Next/KernelSU-Next /tmp/ksun
+            git -C /tmp/ksun log --oneline -1
             H=$(find /tmp/ksun -path '*/uapi/app_profile.h' | head -1)
             test -n "$H" || { echo "app_profile.h not found upstream"; find /tmp/ksun -maxdepth 3 -type d | head -40; exit 1; }
             mkdir -p "$U"
             cp -r "$(dirname "$H")"/. "$U"/
           fi
           test -f "$U/app_profile.h" && echo "OK: $U/app_profile.h present"
+          # The headers must match the vendored .c files, so check the symbols dispatch.c needs.
+          for sym in KSU_GET_INFO_FLAG_PREINIT KSU_LOOKUP_SYMBOLS_MAX KSU_IOCTL_LOOKUP_SYMBOLS ksu_lookup_symbols_cmd; do
+            grep -rq "$sym" "$U" || { echo "MISMATCH: $sym not in uapi headers (wrong upstream commit)"; exit 1; }
+          done
           ls -la "$U"
 
       - name: Build kernel with Kleaf
