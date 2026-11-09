@@ -29,6 +29,9 @@ env:
   # Kernel source (Evolution X cnb-6.6 + KernelSU Next commit). Pin a SHA here to build an exact commit.
   KERNEL_REPO: psychoela/marble-kernel-x
   KERNEL_BRANCH: cnb-6.6
+  # Shown in /proc/version as "(PsychoAvy@github)"
+  BUILD_USER: PsychoAvy
+  BUILD_HOST: github
 
 jobs:
   build:
@@ -106,10 +109,22 @@ jobs:
           cd "$KP"
           LTO=""
           if [ -n "${{ inputs.lto }}" ]; then LTO="--lto=${{ inputs.lto }}"; fi
+
+          # Set the build user/host. Done in two ways because Kleaf may not pass plain env vars into
+          # its sandbox: exported from build.config.constants (CI checkout only, not committed)
+          # and as Bazel action_env.  CHECK: see the "Show kernel version string" step for the result.
+          printf '\nexport KBUILD_BUILD_USER=%s\nexport KBUILD_BUILD_HOST=%s\n' \
+            "$BUILD_USER" "$BUILD_HOST" >> vendor/xiaomi/sm8450-kernel/build.config.constants
+          LTO="$LTO --action_env=KBUILD_BUILD_USER=$BUILD_USER --action_env=KBUILD_BUILD_HOST=$BUILD_HOST"
           # CHECK: some Kleaf versions want --config=local or extra flags on CI runners.
           tools/bazel --output_user_root=/mnt/bazel run $LTO \
             "${{ inputs.bazel_target }}" -- --dist_dir=/mnt/work/dist
           ls -la /mnt/work/dist | head -40
+
+      - name: Show kernel version string
+        run: |
+          IMG=$(find /mnt/work/dist -maxdepth 2 -name Image -type f | head -1)
+          strings "$IMG" | grep -m1 '^Linux version' || echo "version string not found in Image"
 
       - name: Package AnyKernel3 zip
         run: |
