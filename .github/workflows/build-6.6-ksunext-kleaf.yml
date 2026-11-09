@@ -1,5 +1,5 @@
-# Build the marble (POCO F5 / Redmi Note 12 Turbo) 6.6 kernel with KernelSU Next
-# and package the resulting Image as an AnyKernel3 zip.
+# Build the marble (POCO F5 / Redmi Note 12 Turbo) 6.6 kernel with FinaSU (default) or KernelSU Next
+# and package the resulting Image as an AnyKernel3 zip. Pick the root with the "root" input.
 #
 # Lives in psychoela/marble-kernel (the build repo) as .github/workflows/build-6.6-ksunext-kleaf.yml.
 # It builds the kernel source from psychoela/marble-kernel-x, branch cnb-6.6, which already has
@@ -9,11 +9,32 @@
 # STATUS: UNTESTED. Written from reading the repos, not from a successful run.
 # Places most likely to need adjusting are marked with "CHECK".
 
-name: Build marble 6.6 kernel (Kleaf, KernelSU Next built in)
+name: Build marble 6.6 kernel (Kleaf, FinaSU / KernelSU Next)
+run-name: Build marble 6.6 kernel (${{ inputs.root == 'finasu' && 'FinaSU' || 'KernelSU Next' }})
 
 on:
   workflow_dispatch:
     inputs:
+      root:
+        description: "Root solution built into the kernel"
+        type: choice
+        options:
+          - finasu
+          - ksunext
+        default: finasu
+      finasu_ref:
+        description: "FinaSU branch, tag or commit SHA (only used when root = finasu)"
+        default: "master"
+      clang:
+        description: "Compiler: Kleaf's bundled Clang, or upstream LLVM Clang 22.1.8"
+        type: choice
+        options:
+          - kleaf-default
+          - llvm-22.1.8
+        default: kleaf-default
+      clang_url:
+        description: "Download URL for the Clang tarball (only used when clang = llvm-22.1.8)"
+        default: "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-X64.tar.xz"
       bazel_target:
         description: "Kleaf dist target that produces Image"
         default: "//vendor/xiaomi/sm8450-kernel:kernel_aarch64_dist"   # CHECK: confirm name
@@ -103,7 +124,37 @@ jobs:
           git -C "$KP/vendor/xiaomi/sm8450-kernel" log --oneline -2
           ls "$KP/vendor/xiaomi/sm8450-kernel/drivers/kernelsu" | head -3
 
+      - name: Swap in FinaSU (replaces the built-in KernelSU Next driver)
+        if: ${{ inputs.root == 'finasu' }}
+        working-directory: /mnt/work/ws
+        env:
+          FINASU_REF: ${{ inputs.finasu_ref }}
+        run: |
+          # FinaSU (LyraVoid/FinaSU) keeps its driver in kernel/, like upstream KernelSU. Our kernel tree
+          # already wires drivers/kernelsu into drivers/Makefile and drivers/Kconfig, so only the
+          # directory contents change. kernel/include/uapi is a symlink to the repo's uapi/, so copy
+          # with -L (dereference) while it still resolves inside the clone.
+          KSU="$KP/vendor/xiaomi/sm8450-kernel/drivers/kernelsu"
+          rm -rf /tmp/finasu && mkdir /tmp/finasu && cd /tmp/finasu
+          git init -q
+          git remote add origin https://github.com/LyraVoid/FinaSU
+          git fetch --depth 1 origin "${FINASU_REF:-master}"
+          git checkout -q FETCH_HEAD
+          git log --oneline -1
+          test -f kernel/Kbuild || { echo "kernel/Kbuild not found in FinaSU"; ls -la . kernel | head -40; exit 1; }
+          cd /mnt/work/ws
+          rm -rf "$KSU"; mkdir -p "$KSU"
+          cp -rL /tmp/finasu/kernel/. "$KSU"/
+          ls -la "$KSU" | head -40
+          grep -n "config KSU\b" -A4 "$KSU/Kconfig" | head -12
+          # Make sure the driver is switched on even if its Kconfig default is not y.
+          DEF=$(find "$KP/vendor/xiaomi/sm8450-kernel/arch/arm64/configs" -name gki_defconfig | head -1)
+          if [ -n "$DEF" ] && ! grep -q '^CONFIG_KSU=y' "$DEF" && ! grep -A6 'config KSU$' "$KSU/Kconfig" | grep -q 'default y'; then
+            echo "CONFIG_KSU=y" >> "$DEF"; echo "added CONFIG_KSU=y to $DEF"
+          fi
+
       - name: Fix KernelSU-Next include/uapi (symlink does not resolve inside Kleaf)
+        if: ${{ inputs.root == 'ksunext' }}
         working-directory: /mnt/work/ws
         run: |
           # Kbuild already adds -I drivers/kernelsu/include, so "uapi/app_profile.h" must be at
@@ -146,6 +197,40 @@ jobs:
           grep -q "LINUX_COMPILE_BY=${BUILD_USER}" "$F" && grep -q "LINUX_COMPILE_HOST=${BUILD_HOST}" "$F" \
             || { echo "mkcompile_h patch did not apply"; cat "$F" | head -40; exit 1; }
 
+      - name: Name the kernel release after the root (replaces "maybe-dirty")
+        working-directory: /mnt/work/ws
+        env:
+          ROOT_TAG: ${{ inputs.root == 'finasu' && 'FinaSU' || 'KSUNext' }}
+        run: |
+          # Kleaf stamps unstamped builds with "-maybe-dirty". Replace that literal so the release becomes
+          # e.g. 6.6.144-android15-8-FinaSU-4k. The "-androidNN-M" KMI prefix stays intact, and module
+          # vermagic ignores the release string when CONFIG_MODVERSIONS is on.
+          cd "$KP"
+          FILES=$(grep -rIl "maybe-dirty" build/kernel vendor/xiaomi/sm8450-kernel/scripts 2>/dev/null || true)
+          if [ -z "$FILES" ]; then
+            echo "WARNING: 'maybe-dirty' literal not found, kernel release string left unchanged"
+            exit 0
+          fi
+          echo "$FILES"
+          sed -i "s/maybe-dirty/${ROOT_TAG}/g" $FILES
+          grep -rn "$ROOT_TAG" $FILES | head -5
+
+      - name: Download Clang 22.1.8 (upstream LLVM)
+        if: ${{ inputs.clang == 'llvm-22.1.8' }}
+        env:
+          CLANG_URL: ${{ inputs.clang_url }}
+        run: |
+          mkdir -p /mnt/work/clang
+          # Streamed straight into tar so the ~1 GB archive is never stored on disk.
+          curl -fL --retry 3 --retry-delay 5 "$CLANG_URL" | tar -xJ --strip-components=1 -C /mnt/work/clang
+          ls /mnt/work/clang
+          /mnt/work/clang/bin/clang --version
+          /mnt/work/clang/bin/clang --version | grep -q 'clang version 22\.1\.8' \
+            || { echo "downloaded Clang is not 22.1.8"; exit 1; }
+          for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-strip llvm-objdump; do
+            test -x "/mnt/work/clang/bin/$t" || { echo "missing $t in toolchain"; exit 1; }
+          done
+
       - name: Build kernel with Kleaf
         working-directory: /mnt/work/ws
         run: |
@@ -159,6 +244,10 @@ jobs:
           printf '\nexport KBUILD_BUILD_USER=%s\nexport KBUILD_BUILD_HOST=%s\n' \
             "$BUILD_USER" "$BUILD_HOST" >> vendor/xiaomi/sm8450-kernel/build.config.constants
           LTO="$LTO --action_env=KBUILD_BUILD_USER=$BUILD_USER --action_env=KBUILD_BUILD_HOST=$BUILD_HOST"
+          # Optional custom compiler: Kleaf's bazel wrapper takes an absolute path to a Clang toolchain.
+          if [ "${{ inputs.clang }}" = "llvm-22.1.8" ]; then
+            LTO="$LTO --user_clang_toolchain=/mnt/work/clang"
+          fi
           # CHECK: some Kleaf versions want --config=local or extra flags on CI runners.
           tools/bazel --output_user_root=/mnt/bazel run $LTO \
             "${{ inputs.bazel_target }}" -- --dist_dir=/mnt/work/dist
@@ -168,6 +257,8 @@ jobs:
         run: |
           IMG=$(find /mnt/work/dist -maxdepth 2 -name Image -type f | head -1)
           strings "$IMG" | grep -m1 '^Linux version' || echo "version string not found in Image"
+          echo "--- root markers in Image (root=${{ inputs.root }}):"
+          strings "$IMG" | grep -i -m5 -E 'finasu|kernelsu' || echo "no KernelSU/FinaSU strings found"
 
       - name: Package AnyKernel3 zip
         run: |
@@ -182,7 +273,7 @@ jobs:
           cat > anykernel.sh <<'EOF'
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=marble 6.6 + KernelSU Next
+          kernel.string=marble 6.6 + ROOTLABEL
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -210,22 +301,15 @@ jobs:
           write_boot;
           EOF
 
+          if [ "${{ inputs.root }}" = "finasu" ]; then ROOT_NAME=FinaSU; else ROOT_NAME=KSUNext; fi
+          sed -i "s/ROOTLABEL/$ROOT_NAME/" anykernel.sh
           DATE=$(date +%Y%m%d-%H%M)
-          zip -r9 "/mnt/work/marble-6.6-KSUNext-$DATE.zip" . -x '*.git*'
+          zip -r9 "/mnt/work/marble-6.6-$ROOT_NAME-$DATE.zip" . -x '*.git*'
           ls -la /mnt/work/*.zip
 
       - name: Upload zip
         uses: actions/upload-artifact@v4
         with:
-          name: marble-6.6-KSUNext
-          path: /mnt/work/marble-6.6-KSUNext-*.zip
+          name: marble-6.6-${{ inputs.root }}
+          path: /mnt/work/marble-6.6-*.zip
           if-no-files-found: error
-
-      - name: Upload raw Image and config
-        uses: actions/upload-artifact@v4
-        with:
-          name: marble-6.6-Image
-          path: |
-            /mnt/work/dist/Image
-            /mnt/work/dist/.config
-          if-no-files-found: warn
