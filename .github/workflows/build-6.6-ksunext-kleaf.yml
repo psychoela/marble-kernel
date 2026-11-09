@@ -103,6 +103,16 @@ jobs:
           git -C "$KP/vendor/xiaomi/sm8450-kernel" log --oneline -2
           ls "$KP/vendor/xiaomi/sm8450-kernel/drivers/kernelsu" | head -3
 
+      - name: Fix KernelSU-Next include path (uapi/app_profile.h not found)
+        working-directory: /mnt/work/ws
+        run: |
+          KSU="$KP/vendor/xiaomi/sm8450-kernel/drivers/kernelsu"
+          test -f "$KSU/uapi/app_profile.h" || { echo "uapi/app_profile.h missing in vendored KSU-Next, re-import the full v3.4.2 tree"; ls -R "$KSU" | head -40; exit 1; }
+          if ! grep -q 'KSU_INCLUDE_FIX' "$KSU/Kbuild"; then
+            printf '\n# KSU_INCLUDE_FIX: headers include each other as "uapi/..." and "policy/..."\nccflags-y += -I$(srctree)/$(src)\n' >> "$KSU/Kbuild"
+          fi
+          tail -4 "$KSU/Kbuild"
+
       - name: Build kernel with Kleaf
         working-directory: /mnt/work/ws
         run: |
