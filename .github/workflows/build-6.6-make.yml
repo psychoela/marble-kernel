@@ -13,12 +13,10 @@ on:
       clang_choice:
         description: "Which clang to build with"
         type: choice
-        default: llvm-22.1.8
+        default: rom-clang-r510928
         options:
+          - rom-clang-r510928
           - llvm-22.1.8
-          - android-r563880c
-          - alchemist-clang22-lto-20261030
-          - alchemist-clang23-lto-20261030
       publish_release:
         description: "Also publish the zip as a GitHub Release (does not use artifact storage)"
         type: boolean
@@ -39,12 +37,11 @@ env:
   KSUN_REPO: https://github.com/KernelSU-Next/KernelSU-Next
   KSUN_BRANCH: dev
   KSUN_SHA: ""
-  # Android clang (only for clang_choice = android-r563880c)
-  CLANG_DIR: clang-r563880c
-  CLANG_MAJOR: "21"
-  # Alchemist LLVM, used for the alchemist-* choices
-  ALCHEMIST_REPO: nekoshirro/Alchemist-LLVM
-  ALCHEMIST_TAG: lto-20261030
+  # The ROM's own compiler (clang_choice = rom-clang-r510928). config6_6.txt says the ROM kernel was built with
+  # "Android (11368308, +pgo, +bolt, +lto, +mlgo, based on r510928) clang version 18.0.0".
+  # That is the AOSP prebuilt directory clang-r510928, downloaded from android.googlesource.com.
+  CLANG_DIR: clang-r510928
+  CLANG_MAJOR: "18"
   # Release string. "" = auto: base version read from the kernel Makefile + LOCALVERSION_SUFFIX.
   EXPECTED_RELEASE: ""
   # Suffix of the ROM kernel release, as in `uname -r` on the phone. Evolution X 12.4 stock kernel is
@@ -55,7 +52,6 @@ env:
   PHONE_BASE_VERSION: "6.6.144"
   # Ubuntu 24.04 ships pahole 1.25, which this kernel's BTF config needs (CONFIG_PAHOLE_VERSION=125).
   BUILD_IMAGE: ubuntu:24.04
-  BUILD_IMAGE_ALCHEMIST: ubuntu:24.04
   # Kernel-side support for the SUSFS LKM you already use: provides __stack_chk_guard.
   # Set to "0" if you do not use the SUSFS LKM.
   ENABLE_SUSFS_LKM: "1"
@@ -237,14 +233,14 @@ jobs:
           free -g
           nproc
 
-      - name: Download Android clang
-        if: ${{ inputs.clang_choice == 'android-r563880c' }}
+      - name: Download the ROM's clang (AOSP clang-r510928)
+        if: ${{ inputs.clang_choice == 'rom-clang-r510928' }}
         run: |
           set -eux
           cat > fetch-clang.sh <<'EOF'
           #!/bin/bash
           # usage: fetch-clang.sh <repo-url> <clang-dir> <dest>
-          # clang-r563880c is no longer on any branch tip. Find the last commit that still had it
+          # Older prebuilt clangs are removed from the branch tip over time. Find the last commit that still had it
           # (history of main-kernel, metadata only, a few seconds) and download ONLY that directory
           # as a tar.gz from Gitiles (+archive). This replaces the old "git checkout" of a blobless
           # clone, which died with "fatal: expected 'packfile'" (promisor fetch from googlesource).
@@ -293,56 +289,6 @@ jobs:
           bash fetch-clang.sh https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "$CLANG_DIR" "$HOME/clang"
           "$HOME/clang/bin/clang" --version
           "$HOME/clang/bin/clang" --version | grep -q "clang version $CLANG_MAJOR\." || { echo "Expected clang $CLANG_MAJOR but got something else. Check CLANG_DIR."; exit 1; }
-          du -sh "$HOME/clang"
-
-      - name: Download Alchemist LLVM (nekoshirro/Alchemist-LLVM, release lto-20261030)
-        if: ${{ inputs.clang_choice == 'alchemist-clang22-lto-20261030' || inputs.clang_choice == 'alchemist-clang23-lto-20261030' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CLANG_CHOICE: ${{ inputs.clang_choice }}
-        run: |
-          set -eux
-          case "$CLANG_CHOICE" in
-            alchemist-clang23-*) ALCHEMIST_MAJOR=23 ;;
-            *)                   ALCHEMIST_MAJOR=22 ;;
-          esac
-          echo "wanted clang major: $ALCHEMIST_MAJOR"
-          # Download every asset of the release, unpack each one into its own folder and keep the
-          # toolchain whose `clang --version` major matches ALCHEMIST_MAJOR. This does not depend on
-          # the exact asset file names (and skips assets that are not runnable on the x86_64 runner).
-          rm -rf dl alch
-          mkdir -p dl alch "$HOME/clang"
-          gh release download "$ALCHEMIST_TAG" --repo "$ALCHEMIST_REPO" --dir dl --clobber
-          ls -la dl
-          found=0
-          i=0
-          for f in dl/*; do
-            i=$((i+1)); d="alch/$i"; mkdir -p "$d"
-            case "$f" in
-              *.tar.gz|*.tgz) tar -xzf "$f" -C "$d" || continue ;;
-              *.tar.xz)       tar -xJf "$f" -C "$d" || continue ;;
-              *.tar.zst)      tar --zstd -xf "$f" -C "$d" || continue ;;
-              *.zip)          unzip -q "$f" -d "$d" || continue ;;
-              *) echo "skip $f"; continue ;;
-            esac
-            C="$(find "$d" -maxdepth 4 -path '*/bin/clang' \( -type f -o -type l \) | head -n1)"
-            [ -n "$C" ] || { echo "no bin/clang in $f"; continue; }
-            V="$("$C" --version 2>/dev/null | sed -n '1s/.*clang version \([0-9][0-9]*\)\..*/\1/p')" || V=""
-            echo "$f -> clang major '${V:-unrunnable}'"
-            if [ "$V" = "$ALCHEMIST_MAJOR" ]; then
-              ROOT="$(dirname "$(dirname "$C")")"
-              rm -rf "$HOME/clang"
-              mv "$ROOT" "$HOME/clang"
-              found=1
-              break
-            fi
-          done
-          [ "$found" = 1 ] || { echo "ERROR: no clang $ALCHEMIST_MAJOR toolchain found in $ALCHEMIST_REPO $ALCHEMIST_TAG"; exit 1; }
-          rm -rf dl alch
-          "$HOME/clang/bin/clang" --version
-          for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
-            test -x "$HOME/clang/bin/$t" || { echo "MISSING $t"; exit 1; }
-          done
           du -sh "$HOME/clang"
 
       - name: Download upstream LLVM 22.1.8
@@ -600,7 +546,6 @@ jobs:
         run: |
           set -eux
           IMG="$BUILD_IMAGE"
-          case "$CLANG_CHOICE" in alchemist-*) IMG="$BUILD_IMAGE_ALCHEMIST" ;; esac
           echo "build image: $IMG"
           docker run --rm \
             -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
