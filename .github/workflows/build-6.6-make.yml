@@ -1,4 +1,4 @@
-name: Build marble 6.6 kernel (make + LLVM, FinaSU or KernelSU-Next, real uname)
+name: Build marble 6.6 kernel (make + LLVM, NoMount + FinaSU or KernelSU-Next)
 
 on:
   workflow_dispatch:
@@ -17,6 +17,10 @@ on:
         options:
           - rom-clang-r510928
           - llvm-22.1.8
+      with_nomount:
+        description: "Build NoMount (maxsteeel/nomount) into the kernel"
+        type: boolean
+        default: true
       publish_release:
         description: "Also publish the zip as a GitHub Release (does not use artifact storage)"
         type: boolean
@@ -28,6 +32,11 @@ env:
   KERNEL_REPO: https://github.com/psychoela/marble-kernel-x
   KERNEL_BRANCH: cnb-6.6
   KERNEL_SHA: ""
+  # NoMount (maxsteeel/nomount), used when with_nomount is on. NOMOUNT_BRANCH "latest" = newest GitHub release
+  # tag (auto-detected), falling back to the newest tag, then master. Put a fixed tag here to pin.
+  NOMOUNT_REPO: https://github.com/maxsteeel/nomount
+  NOMOUNT_BRANCH: latest
+  NOMOUNT_SHA: ""
   # FinaSU (LyraVoid/FinaSU, a KernelSU fork). FINASU_BRANCH "latest" = newest GitHub release tag.
   # The release APK of the SAME tag is used for the manager certificate, so kernel and manager match.
   FINASU_REPO: https://github.com/LyraVoid/FinaSU
@@ -75,6 +84,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ROOT_CHOICE: ${{ inputs.root_choice }}
+          WITH_NOMOUNT: ${{ inputs.with_nomount }}
         run: |
           set -eu
           # latest_tag <owner/repo>: newest non-prerelease release; else newest release incl. prereleases;
@@ -91,7 +101,12 @@ jobs:
             [ -n "$T" ] || { echo "ERROR: could not find the latest FinaSU release"; exit 1; }
             echo "FINASU_BRANCH=$T" >> "$GITHUB_ENV"
           fi
-          grep -E '^FINASU_BRANCH=' "$GITHUB_ENV" || echo "nothing auto-resolved (pinned)"
+          if [ "$WITH_NOMOUNT" = true ] && [ "$NOMOUNT_BRANCH" = latest ]; then
+            T="$(latest_tag maxsteeel/nomount)"
+            if [ -z "$T" ]; then echo "No NoMount release/tag found, using master"; T=master; fi
+            echo "NOMOUNT_BRANCH=$T" >> "$GITHUB_ENV"
+          fi
+          grep -E '^(FINASU|NOMOUNT)_BRANCH=' "$GITHUB_ENV" || echo "nothing auto-resolved (pinned)"
 
       - name: Select root solution (FinaSU or KernelSU-Next)
         env:
@@ -123,6 +138,8 @@ jobs:
           grep -q '^CONFIG_CFI_CLANG=y' config6_6.txt
           grep -q '^CONFIG_ARM64_4K_PAGES=y' config6_6.txt
           grep -q '^CONFIG_KPROBES=y' config6_6.txt || echo "WARNING: CONFIG_KPROBES is not =y in config6_6.txt"
+          # NoMount v2 talks to userspace through the keyring API (add_key), so it needs CONFIG_KEYS
+          grep -q '^CONFIG_KEYS=y' config6_6.txt || echo "WARNING: CONFIG_KEYS is not =y in config6_6.txt, NoMount v2 needs it"
           grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG_[A-Z]+|LTO_NONE|TRIM_UNUSED_KSYMS|MODULE_SIG_PROTECT|DEBUG_INFO_BTF|KSU[A-Z_]*)=' config6_6.txt || true
           echo "config6_6.txt looks right"
 
@@ -316,6 +333,8 @@ jobs:
           du -sh "$HOME/clang"
 
       - name: Fetch sources at pinned commits
+        env:
+          WITH_NOMOUNT: ${{ inputs.with_nomount }}
         run: |
           set -eux
           fetch_sha() { # url sha-or-branch dir
@@ -326,6 +345,11 @@ jobs:
           }
           # kernel: pinned SHA if KERNEL_SHA is set, otherwise tip of KERNEL_BRANCH
           fetch_sha "$KERNEL_REPO" "${KERNEL_SHA:-$KERNEL_BRANCH}" kernel
+          if [ "$WITH_NOMOUNT" = true ]; then
+            fetch_sha "$NOMOUNT_REPO" "${NOMOUNT_SHA:-$NOMOUNT_BRANCH}" nomount
+            git -C nomount log -1 --format='nomount %H %s'
+            ls -la nomount/kernel/src
+          fi
           # Root solution (FinaSU or KernelSU-Next): full history, its version number is computed from commit count.
           # ROOT_REF can be a branch or a release tag.
           git clone -q --branch "$ROOT_REF" "$ROOT_REPO" rootsu
@@ -337,7 +361,9 @@ jobs:
           git -C kernel log -1 --format='kernel %H %s'
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' kernel/Makefile | head -3
 
-      - name: Integrate the root solution (FinaSU or KernelSU-Next)
+      - name: Integrate NoMount and the root solution (FinaSU or KernelSU-Next)
+        env:
+          WITH_NOMOUNT: ${{ inputs.with_nomount }}
         run: |
           set -eux
           K="$PWD/kernel"
@@ -352,6 +378,17 @@ jobs:
           # The 6.6 tree already ships a vendored KernelSU-Next copy in drivers/kernelsu. Show it, then start clean.
           ls -ld "$K/drivers/kernelsu" "$K/FinaSU" "$K/KernelSU-Next" 2>&1 || true
           rm -rf "$K/drivers/kernelsu" "$K/FinaSU" "$K/KernelSU-Next"
+
+          # NoMount: copy its kernel source into fs/nomount and hook it into fs/Makefile and fs/Kconfig
+          if [ "$WITH_NOMOUNT" = true ]; then
+            ls -ld "$K/fs/nomount" 2>&1 || true
+            rm -rf "$K/fs/nomount"
+            mkdir -p "$K/fs/nomount"
+            cp -f nomount/kernel/src/* "$K/fs/nomount/"
+            grep -q nomount "$K/fs/Makefile" || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> "$K/fs/Makefile"
+            add_source "$K/fs/Kconfig" 'source "fs/nomount/Kconfig"'
+            grep -n nomount "$K/fs/Makefile" "$K/fs/Kconfig"
+          fi
 
           # Root solution (FinaSU or KernelSU-Next): keep it a git repo inside the tree,
           # symlink like KernelSU's setup.sh does
@@ -450,6 +487,7 @@ jobs:
           mkdir -p out
           cp ../config6_6.txt out/.config
           printf 'CONFIG_KSU=y\n' >> out/.config
+          if [ "${WITH_NOMOUNT:-false}" = true ]; then printf 'CONFIG_NOMOUNT=y\n' >> out/.config; fi
           # Use tracepoint hook mode when this KernelSU fork offers it (ignored otherwise)
           if grep -rqE 'config KSU_TRACEPOINT_HOOK' "/w/kernel/$ROOT_DIR/kernel" --include='Kconfig*'; then
             echo 'CONFIG_KSU_TRACEPOINT_HOOK=y' >> out/.config
@@ -472,9 +510,10 @@ jobs:
           sed -i 's/^CONFIG_WERROR=y/# CONFIG_WERROR is not set/' out/.config
           sed -i "s/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"$LOCALVERSION_SUFFIX\"/; s/^CONFIG_LOCALVERSION_AUTO=y/# CONFIG_LOCALVERSION_AUTO is not set/" out/.config
           make $MK olddefconfig
-          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|KSU|LTO_NONE|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|DEBUG_INFO_BTF|TRIM_UNUSED_KSYMS|MODULE_SIG_PROTECT|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|KALLSYMS|KALLSYMS_ALL|KPROBES|LOCALVERSION|DEBUG_INFO|DEBUG_INFO_BTF)=' out/.config || true
+          grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|KSU|NOMOUNT|KEYS|LTO_NONE|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|DEBUG_INFO_BTF|TRIM_UNUSED_KSYMS|MODULE_SIG_PROTECT|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|KALLSYMS|KALLSYMS_ALL|KPROBES|LOCALVERSION|DEBUG_INFO|DEBUG_INFO_BTF)=' out/.config || true
           # These must survive olddefconfig, otherwise vendor modules will not load
           grep -q '^CONFIG_KSU=y' out/.config
+          if [ "${WITH_NOMOUNT:-false}" = true ]; then grep -q '^CONFIG_NOMOUNT=y' out/.config; fi
           grep -q '^CONFIG_MODULES=y' out/.config
           grep -q '^CONFIG_TCP_CONG_BBR=y' out/.config
           grep -q '^CONFIG_TCP_CONG_WESTWOOD=y' out/.config
@@ -511,6 +550,7 @@ jobs:
           strings -n 8 arch/arm64/boot/Image | grep -m1 'Linux version 6.6'
           strings arch/arm64/boot/Image | grep -qx "$EXPECTED_RELEASE SMP preempt mod_unload modversions aarch64" \
             || echo "WARNING: vermagic string differs from \"$EXPECTED_RELEASE SMP preempt mod_unload modversions aarch64\", check the strings in the Image"
+          if [ "${WITH_NOMOUNT:-false}" = true ]; then echo "nomount symbols: $(grep -cE ' [tT] nm_' System.map)"; fi
           if [ -s /w/finasu-manager.hash ]; then
             if strings arch/arm64/boot/Image | grep -qF "$(cat /w/finasu-manager.hash)"; then
               echo "FinaSU manager certificate hash is inside the Image: yes"
@@ -543,6 +583,7 @@ jobs:
       - name: Configure, build and verify (inside Ubuntu container)
         env:
           CLANG_CHOICE: ${{ inputs.clang_choice }}
+          WITH_NOMOUNT: ${{ inputs.with_nomount }}
         run: |
           set -eux
           IMG="$BUILD_IMAGE"
@@ -554,6 +595,7 @@ jobs:
             -e ROOT_NAME="$ROOT_NAME" \
             -e ROOT_DIR="$ROOT_DIR" \
             -e ENABLE_SUSFS_LKM="$ENABLE_SUSFS_LKM" \
+            -e WITH_NOMOUNT="$WITH_NOMOUNT" \
             -e MODULE_SIG_PROTECT_OFF="$MODULE_SIG_PROTECT_OFF" \
             -v "$PWD":/w \
             -v "$HOME/clang":/clang:ro \
@@ -570,9 +612,11 @@ jobs:
       - name: Package AnyKernel3 zip
         env:
           ROOT_CHOICE: ${{ inputs.root_choice }}
+          WITH_NOMOUNT: ${{ inputs.with_nomount }}
         run: |
           set -eux
-          if [ "$ROOT_CHOICE" = kernelsu-next ]; then ZIP_NAME=marble-6.6-ksunext.zip; else ZIP_NAME=marble-6.6-finasu.zip; fi
+          NM=""; [ "$WITH_NOMOUNT" = true ] && NM="-nomount"
+          if [ "$ROOT_CHOICE" = kernelsu-next ]; then ZIP_NAME="marble-6.6-ksunext$NM.zip"; else ZIP_NAME="marble-6.6-finasu$NM.zip"; fi
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
           test -f kernel/out/arch/arm64/boot/Image
           git clone -q --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
@@ -609,7 +653,8 @@ jobs:
           split_boot;
           flash_boot;
           EOF
-          sed -i "s/ROOTLABEL/$ROOT_NAME/g" anykernel.sh
+          LABEL="$ROOT_NAME"; [ "$WITH_NOMOUNT" = true ] && LABEL="NoMount + $ROOT_NAME"
+          sed -i "s/ROOTLABEL/$LABEL/g" anykernel.sh
           cp ../kernel/out/arch/arm64/boot/Image Image
           zip -qr9 "../$ZIP_NAME" .
           cd ..
@@ -621,6 +666,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CLANG_CHOICE: ${{ inputs.clang_choice }}
+          WITH_NOMOUNT: ${{ inputs.with_nomount }}
         run: |
           set -eu
           TAG="build-66-${{ github.run_number }}"
@@ -657,6 +703,10 @@ jobs:
             echo "\`${REL}\`"
             echo
             echo "- **Root:** ${ROOT_NAME} \`${RDESC}\` ([\`${RSHORT}\`](${ROOT_URL}/commit/${RSHA}), ${RCOUNT} commits) · ref \`${ROOT_REF}\`"
+            if [ "$WITH_NOMOUNT" = true ]; then
+              NSHA="$(git -C nomount rev-parse HEAD 2>/dev/null || echo unknown)"
+              echo "- **NoMount:** built in (install the NoMount module after flashing) · ref \`${NOMOUNT_BRANCH}\` · [\`$(echo "$NSHA" | cut -c1-7)\`](${NOMOUNT_REPO}/commit/${NSHA})"
+            fi
             echo "- **Clang:** \`${CLANG_VER}\` · ${LTO} · ${CFI} · choice \`${CLANG_CHOICE}\`"
             echo "- **Commit:** [\`${KSHORT}\`](${KERNEL_REPO}/commit/${KSHA}) · ${KSUBJ}"
             echo "- **Base:** [psychoela/marble-kernel-x](${KERNEL_REPO}), branch \`${KERNEL_BRANCH}\`"
@@ -666,7 +716,7 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Kernel base | ${KVER} (phone runs ${PHONE_BASE_VERSION}) |"
-            echo "| Root options | ${KSU_OPTS:-none} |"
+            echo "| Root options | ${KSU_OPTS:-none}$( [ "$WITH_NOMOUNT" = true ] && echo ', NOMOUNT') |"
             echo "| Manager | ${CERT_TXT} |"
             echo "| Build env | ${BUILD_IMAGE} |"
             echo "| Built by | ${GITHUB_ACTOR} as PsychoAvy@github · $(date -u '+%Y-%m-%d %H:%M UTC') |"
@@ -686,7 +736,7 @@ jobs:
           gh release create "$TAG" "$ZIP" Image SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "marble ${KVER} ${ROOT_NAME} · run ${RUN_NO}" \
+            --title "marble ${KVER} ${ROOT_NAME}$( [ "$WITH_NOMOUNT" = true ] && echo ' + NoMount') · run ${RUN_NO}" \
             --notes-file release-notes.md \
             --prerelease
 
