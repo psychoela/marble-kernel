@@ -595,6 +595,11 @@ jobs:
             # 2) security/selinux: the whole SUSFS SELinux layer (hooks.c, selinuxfs.c, status.c, ss/services.c) is written
             #    for the 6.1 selinux_state API and breaks the 6.6 build (about 20 errors). It is reverted, so the SELinux
             #    context hiding part of SUSFS is not active in this build.
+            # Diagnostics for porting the SELinux layer to 6.6 later (printed before it is reverted)
+            echo "=================== SELINUX-LAYER DIFF (for porting)"
+            git diff --stat -- security include/linux include/uapi | tail -30 || true
+            git diff -U3 -- security/selinux/selinuxfs.c security/selinux/status.c security/selinux/avc.c security/selinux/include || true
+            echo "=================== END SELINUX-LAYER DIFF"
             git checkout -- security/selinux
             git status --short security/selinux | head
             # Diagnostics: what the SUSFS patch changed in the files that are known to differ on 6.6
