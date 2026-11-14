@@ -617,23 +617,6 @@ jobs:
 
           grep -n kernelsu "$K/drivers/Makefile" "$K/drivers/Kconfig"
 
-          # selinux_hide is a KernelSU-Next core feature (always compiled in, called unconditionally from
-          # kernel init), not gated by any .config symbol. Its kernel-side support (fake status page,
-          # selinuxfs hooks) was part of the SUSFS patch and is not carried on this 6.6 build (see the
-          # SELinux-layer diff above), so letting it run just produces a confusing "fake status is not
-          # initialized after post-fs-data!" warning for a feature that cannot work. Disable the one call
-          # that starts it, so it never runs; everything else in the root tree (su, profiles, supercalls,
-          # SUSFS path/mount/kstat hiding) is untouched.
-          INIT_C="$K/$ROOT_DIR/kernel/core/init.c"
-          if [ -f "$INIT_C" ]; then
-            if grep -qP '^\tksu_selinux_hide_init\(\);$' "$INIT_C"; then
-              sed -i 's/^\tksu_selinux_hide_init();$/\t\/* disabled: no kernel-side support in this 6.6 build *\/ \/\/ ksu_selinux_hide_init();/' "$INIT_C"
-              grep -n 'ksu_selinux_hide_init' "$INIT_C"
-            else
-              echo "NOTE: ksu_selinux_hide_init() call not found in $INIT_C in the expected form; left as-is"
-            fi
-          fi
-
           # Built-in SUSFS: warn early if the root side calls susfs_* functions that the SUSFS kernel side does not
           # declare or define (that is what stops the build at compile time, minutes later).
           if [ "$WITH_SUSFS" = true ]; then
@@ -943,9 +926,7 @@ jobs:
           WITH_SUSFS: ${{ inputs.with_susfs }}
         run: |
           set -eu
-          # run_id (not run_number): run_number resets to 1 whenever this workflow file is replaced/recreated,
-          # which collided with an existing "build-66-1" release tag. run_id is globally unique and never repeats.
-          TAG="build-66-${{ github.run_id }}"
+          TAG="build-66-${{ github.run_number }}"
           RUN_NO="${{ github.run_number }}"
           RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           CFG=kernel/out/.config
