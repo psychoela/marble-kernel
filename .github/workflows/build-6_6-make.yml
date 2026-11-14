@@ -475,8 +475,17 @@ jobs:
             cp -rf susfs/kernel_patches/include/linux/. "$K/include/linux/"
             cd "$K"
             if ! patch -p1 --dry-run --no-backup-if-mismatch < "$P" > "$GITHUB_WORKSPACE/susfs-dryrun.log" 2>&1; then
-              cat "$GITHUB_WORKSPACE/susfs-dryrun.log"
-              echo "ERROR: the SUSFS kernel patch does not apply cleanly to this kernel tree (failed hunks above). Nothing was built."
+              grep -E '^(checking file|patching file|Hunk .*FAILED|.* out of .* FAILED)' "$GITHUB_WORKSPACE/susfs-dryrun.log" | grep -B1 -E 'FAILED' || true
+              # Real run only to produce the rejects, so the exact failing hunks and the code around them show in this log
+              patch -p1 --no-backup-if-mismatch --reject-format=unified < "$P" > "$GITHUB_WORKSPACE/susfs-real.log" 2>&1 || true
+              for r in $(find . -name '*.rej' | sort); do
+                echo "=================== REJECT $r"
+                cat "$r"
+                f="${r%.rej}"
+                echo "----- first 80 lines of $f (include area)"
+                sed -n 1,80p "$f"
+              done
+              echo "ERROR: the SUSFS kernel patch does not apply cleanly to this kernel tree (rejected hunks above). Nothing was built."
               exit 1
             fi
             patch -p1 --no-backup-if-mismatch < "$P"
