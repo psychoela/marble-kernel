@@ -50,12 +50,14 @@ env:
   FGP_REPO: https://github.com/aerath-stuff/fgetpriority
   FGP_BRANCH: master
   FGP_SHA: ""
-  # Built-in SUSFS, used when with_susfs is on. The kernel side patch comes from simonpunk's susfs4ksu
-  # (branch gki-android15-6.6), the root side from the dev-susfs branch of KernelSU-Next, which already
-  # contains the SUSFS changes. SUSFS_SHA "" = tip of SUSFS_BRANCH. Put a commit SHA to pin.
-  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
-  # gki-android15-6.6 is SUSFS 2.3.0 and is too old for the dev-susfs branch of KernelSU-Next (build 1 failed with
-  # "undeclared function susfs_parse_sus_path_app_strings"), so the -dev branch is used. Change it back if needed.
+  # Built-in SUSFS, used when with_susfs is on. The root side is the dev-susfs branch of pershoot/KernelSU-Next, which
+  # carries SUSFS v2.4.0 and calls functions (susfs_parse_sus_path_app_strings, susfs_kstat_gate_allowed, ...) that
+  # simonpunk's susfs4ksu (v2.3.0) does not have. Builds 1 and 2 failed on that ("call to undeclared function
+  # susfs_parse_sus_path_app_strings"). The matching kernel side is pershoot's own susfs4ksu fork, the one named in
+  # the commit message of "kernel: susfs (v2.4.0): Introduce SuSFS" in KernelSU-Next dev-susfs. The fork only has
+  # the 6.1 branch named in that commit message; the 6.6 branch name below is the same pattern, the log lists the real ones.
+  # SUSFS_SHA "" = tip of SUSFS_BRANCH. Put a commit SHA to pin.
+  SUSFS_REPO: https://gitlab.com/pershoot/susfs4ksu
   SUSFS_BRANCH: gki-android15-6.6-dev
   SUSFS_SHA: ""
   KSUN_SUSFS_REPO: https://github.com/pershoot/KernelSU-Next
@@ -391,10 +393,12 @@ jobs:
             find fgetpriority -path fgetpriority/.git -prune -o -type f -print | head -50
           fi
           if [ "$WITH_SUSFS" = true ]; then
-            fetch_sha "$SUSFS_REPO" "${SUSFS_SHA:-$SUSFS_BRANCH}" susfs
+            echo "== branches available in $SUSFS_REPO:"
+            git ls-remote --heads "$SUSFS_REPO" | sed 's|.*refs/heads/||' | sort || true
+            fetch_sha "$SUSFS_REPO" "${SUSFS_SHA:-$SUSFS_BRANCH}" susfs || { echo "ERROR: cannot fetch ${SUSFS_SHA:-$SUSFS_BRANCH} from $SUSFS_REPO, pick a branch from the list above and set SUSFS_BRANCH"; exit 1; }
             git -C susfs log -1 --format='susfs %H %s'
             ls -la susfs/kernel_patches susfs/kernel_patches/fs susfs/kernel_patches/include/linux
-            test -f susfs/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch || { echo "ERROR: 50_add_susfs_in_gki-android15-6.6.patch not found in $SUSFS_BRANCH"; exit 1; }
+            ls susfs/kernel_patches/50_add_susfs_in_gki-android15-6.6*.patch || { echo "ERROR: no 50_add_susfs_in_gki-android15-6.6*.patch in $SUSFS_BRANCH of $SUSFS_REPO"; exit 1; }
           fi
           # Root solution (FinaSU or KernelSU-Next): full history, its version number is computed from commit count.
           # ROOT_REF can be a branch or a release tag.
@@ -462,7 +466,8 @@ jobs:
           # Built-in SUSFS: copy its fs/ and include/ files, then apply the kernel patch for gki-android15-6.6.
           # The root side is already inside the dev-susfs branch of KernelSU-Next, so 10_enable_susfs_for_ksu.patch is not used.
           if [ "$WITH_SUSFS" = true ]; then
-            P="$GITHUB_WORKSPACE/susfs/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch"
+            P="$(ls "$GITHUB_WORKSPACE"/susfs/kernel_patches/50_add_susfs_in_gki-android15-6.6*.patch | head -n1)"
+            echo "SUSFS kernel patch: $P"
             cp -rf susfs/kernel_patches/fs/. "$K/fs/"
             cp -rf susfs/kernel_patches/include/linux/. "$K/include/linux/"
             cd "$K"
@@ -494,7 +499,7 @@ jobs:
               MISSING="$MISSING $fn"
             done
             if [ -n "$MISSING" ]; then
-              echo "WARNING: KernelSU-Next calls these susfs functions that the SUSFS kernel side ($SUSFS_BRANCH) does not provide:$MISSING"
+              echo "WARNING: KernelSU-Next calls these susfs functions that the SUSFS kernel side ($SUSFS_REPO $SUSFS_BRANCH) does not provide:$MISSING"
               echo "WARNING: the build will most likely fail. Use a SUSFS branch/commit that matches the KernelSU-Next branch."
             else
               echo "SUSFS check: every susfs_* function used by KernelSU-Next is provided by the SUSFS kernel side"
