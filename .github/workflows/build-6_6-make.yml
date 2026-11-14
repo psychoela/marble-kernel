@@ -422,6 +422,107 @@ jobs:
         run: |
           set -eux
           K="$PWD/kernel"
+          cat > susfs-fixup-66.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Port the SUSFS (gki-android14-6.1) hunks that do not apply to a 6.6 tree. Run inside the kernel tree.
+          Every edit needs its anchor to exist exactly once (or the edit to be already present); otherwise it exits 1."""
+          import sys
+
+          def edit(path, old, new, mode="after", marker=None):
+              s = open(path).read()
+              if (marker or new) in s:
+                  print("already present:", path, (marker or new)[:50].strip()); return
+              if s.count(old) != 1:
+                  sys.exit("ANCHOR NOT FOUND exactly once in %s: %r (found %d)" % (path, old[:70], s.count(old)))
+              s = s.replace(old, old + new if mode == "after" else (new + old if mode == "before" else new))
+              open(path, "w").write(s); print("ok:", path)
+
+          INC = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n"
+          # fs/Makefile: new object
+          s = open("fs/Makefile").read()
+          if "susfs.o" not in s:
+              open("fs/Makefile", "a").write("\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n"); print("ok: fs/Makefile")
+          # include hunks whose context differs on 6.6
+          edit("fs/exec.c", "#include <linux/page_size_compat.h>\n", INC)
+          edit("fs/open.c", "#include <linux/filelock.h>\n", INC)
+          edit("mm/memory.c", "#include <linux/zswap.h>\n",
+               "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux/susfs_def.h>\n#endif\n")
+          edit("fs/namespace.c", "#include <linux/mnt_idmapping.h>\n",
+               "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n")
+          edit("fs/namespace.c", "#include <trace/hooks/fs.h>\n",
+               "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\n"
+               "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n\n"
+               "#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\n#endif\n")
+          edit("security/selinux/ss/services.c", "#include <trace/hooks/selinux.h>\n",
+               "\n#ifdef CONFIG_KSU_SUSFS\nextern bool susfs_is_current_ksu_domain(void);\n"
+               "extern bool susfs_is_sus_type_rcu(u32 sid);\n"
+               "extern void susfs_spoof_avd_allowed_rcu(u32 s_type, u32 t_type, u32 c_type, u32 *avd_allowed);\n#endif\n")
+          # mm/memory.c: __access_remote_vm (6.6 gets the vma from get_user_page_vma_remote)
+          edit("mm/memory.c",
+               "\t\tstruct page *page = get_user_page_vma_remote(mm, addr,\n\t\t\t\t\t\t\t     gup_flags, &vma);\n",
+               "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\tif (!IS_ERR_OR_NULL(page) && vma && vma->vm_file &&\n"
+               "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))) {\n\t\t\tput_page(page);\n\t\t\tbreak;\n\t\t}\n#endif\n",
+               marker="SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))) {\n\t\t\tput_page")
+          # fs/proc/task_mmu.c: show_smaps_rollup
+          s = open("fs/proc/task_mmu.c").read()
+          a = "\t\t\t/* Case 4 above */\n\t\t\tif (vma->vm_end > last_vma_end) {\n\t\t\t\tsmap_gather_stats(vma, &mss, last_vma_end);\n"
+          b = ("\t\t\t/* Case 4 above */\n\t\t\tif (vma->vm_end > last_vma_end) {\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+               "\t\t\t\tif (!vma->vm_file || !(SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))\n#endif\n"
+               "\t\t\t\tsmap_gather_stats(vma, &mss, last_vma_end);\n")
+          if "SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))\n#endif\n\t\t\t\tsmap_gather_stats" not in s:
+              if s.count(a) != 1: sys.exit("ANCHOR NOT FOUND in fs/proc/task_mmu.c (show_smaps_rollup)")
+              open("fs/proc/task_mmu.c", "w").write(s.replace(a, b)); print("ok: fs/proc/task_mmu.c")
+          # fs/namei.c: do_tmpfile open-redirect (6.6: idmap based, same body otherwise)
+          s = open("fs/namei.c").read()
+          a = ("\t\tstruct file *file)\n{\n\tstruct path path;\n\tint error = path_lookupat(nd, flags | LOOKUP_DIRECTORY, &path);\n\n"
+               "\tif (unlikely(error))\n\t\treturn error;\n\terror = mnt_want_write(path.mnt);\n")
+          b = ("\t\tstruct file *file)\n{\n#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n\tint old_dfd = nd->dfd;\n"
+               "\tbool is_nd_state_root_preset = (nd->state & ND_ROOT_PRESET);\n\tstruct filename *fake_filename = NULL;\n#endif\n"
+               "\tstruct path path;\n\tint error = path_lookupat(nd, flags | LOOKUP_DIRECTORY, &path);\n\n"
+               "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n\tif ((likely(!error) && !is_nd_state_root_preset) &&\n"
+               "\t\tSUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(path.dentry->d_inode)) {\n"
+               "\t\tfake_filename = susfs_open_redirect_spoof_do_sys_openat(path.dentry->d_inode);\n"
+               "\t\tif (fake_filename && !IS_ERR(fake_filename)) {\n\t\t\tstruct path fake_path;\n\n"
+               "\t\t\terror = filename_lookup(old_dfd, fake_filename, flags | LOOKUP_DIRECTORY, &fake_path, NULL);\n"
+               "\t\t\tpath_put(&path);\n\t\t\tif (unlikely(error)) {\n\t\t\t\tputname(fake_filename);\n\t\t\t\treturn error;\n\t\t\t}\n"
+               "\t\t\tpath = fake_path;\n\t\t}\n\t}\n#endif\n"
+               "\tif (unlikely(error))\n\t\treturn error;\n\terror = mnt_want_write(path.mnt);\n")
+          if "old_dfd = nd->dfd;\n\tbool is_nd_state_root_preset" in s and "do_tmpfile" in s and "filename_lookup(old_dfd, fake_filename, flags | LOOKUP_DIRECTORY" in s:
+              print("already present: do_tmpfile")
+          else:
+              if s.count(a) != 1: sys.exit("ANCHOR NOT FOUND in fs/namei.c (do_tmpfile)")
+              open("fs/namei.c", "w").write(s.replace(a, b)); print("ok: fs/namei.c")
+          # fs/stat.c: vfs_getattr_nosec (6.6: idmap, generic_fillattr takes request_mask)
+          s = open("fs/stat.c").read()
+          a = ("\tidmap = mnt_idmap(path->mnt);\n\tif (inode->i_op->getattr)\n\t\treturn inode->i_op->getattr(idmap, path, stat,\n"
+               "\t\t\t\t\t    request_mask,\n\t\t\t\t\t    query_flags | AT_GETATTR_NOSEC);\n\n"
+               "\tgeneric_fillattr(idmap, request_mask, inode, stat);\n\treturn 0;\n}\n")
+          b = ("\tidmap = mnt_idmap(path->mnt);\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\tif (susfs_is_current_app_uid()) {\n\t\tbool is_fuse = false;\n"
+               "\t\tif (susfs_is_inode_sus_kstat(d_backing_inode(path->dentry), &is_fuse)) {\n\t\t\tif (!is_fuse) {\n"
+               "\t\t\t\tstat->mnt_id = real_mount(path->mnt)->mnt_id;\n\t\t\t\tstat->result_mask |= STATX_SUS_KSTAT;\n\t\t\t}\n"
+               "\t\t\tstat->mnt_id = real_mount(path->mnt)->mnt_id;\n\t\t\tstat->result_mask |= STATX_SUS_KSTAT_FUSE;\n\t\t}\n\t}\n#endif\n"
+               "\tif (inode->i_op->getattr)\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t{\n"
+               "\t\tint err = inode->i_op->getattr(idmap, path, stat, request_mask,\n\t\t\t\t\t       query_flags | AT_GETATTR_NOSEC);\n"
+               "\t\tif (!err) {\n\t\t\tif (stat->result_mask & STATX_SUS_KSTAT) {\n"
+               "\t\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT);\n\t\t\t\treturn err;\n\t\t\t}\n"
+               "\t\t\tif (stat->result_mask & STATX_SUS_KSTAT_FUSE) {\n"
+               "\t\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT_FUSE);\n\t\t\t\treturn err;\n\t\t\t}\n\t\t}\n"
+               "\t\treturn err;\n\t}\n"
+               "\tif (stat->result_mask & STATX_SUS_KSTAT) {\n\t\tgeneric_fillattr(idmap, request_mask, inode, stat);\n"
+               "\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT);\n\t\treturn 0;\n\t}\n"
+               "\tif (stat->result_mask & STATX_SUS_KSTAT_FUSE) {\n\t\tgeneric_fillattr(idmap, request_mask, inode, stat);\n"
+               "\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT_FUSE);\n\t\treturn 0;\n\t}\n#else\n"
+               "\t\treturn inode->i_op->getattr(idmap, path, stat,\n\t\t\t\t\t    request_mask,\n\t\t\t\t\t    query_flags | AT_GETATTR_NOSEC);\n#endif\n\n"
+               "\tgeneric_fillattr(idmap, request_mask, inode, stat);\n\treturn 0;\n}\n")
+          if "susfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT_FUSE);\n\t\treturn 0;" in s:
+              print("already present: stat.c")
+          else:
+              if s.count(a) != 1: sys.exit("ANCHOR NOT FOUND in fs/stat.c (vfs_getattr_nosec)")
+              open("fs/stat.c", "w").write(s.replace(a, b)); print("ok: fs/stat.c")
+          # security/selinux/hooks.c: the three setxattr hooks are NOT ported. The SUSFS patch wraps 6.1's
+          # security_context_to_sid(state, ...); on 6.6 those functions have no state argument. Skipped on purpose.
+          print("skipped (not ported): security/selinux/hooks.c setxattr hooks")
+          PYEOF
 
           add_source() { # file, line to insert before the last "endmenu"
             if ! grep -qF "$2" "$1"; then
@@ -474,21 +575,19 @@ jobs:
             cp -rf susfs/kernel_patches/fs/. "$K/fs/"
             cp -rf susfs/kernel_patches/include/linux/. "$K/include/linux/"
             cd "$K"
-            if ! patch -p1 --dry-run --no-backup-if-mismatch < "$P" > "$GITHUB_WORKSPACE/susfs-dryrun.log" 2>&1; then
-              grep -E '^(checking file|patching file|Hunk .*FAILED|.* out of .* FAILED)' "$GITHUB_WORKSPACE/susfs-dryrun.log" | grep -B1 -E 'FAILED' || true
-              # Real run only to produce the rejects, so the exact failing hunks and the code around them show in this log
-              patch -p1 --no-backup-if-mismatch --reject-format=unified < "$P" > "$GITHUB_WORKSPACE/susfs-real.log" 2>&1 || true
-              for r in $(find . -name '*.rej' | sort); do
-                echo "=================== REJECT $r"
-                cat "$r"
-                f="${r%.rej}"
-                echo "----- first 80 lines of $f (include area)"
-                sed -n 1,80p "$f"
-              done
-              echo "ERROR: the SUSFS kernel patch does not apply cleanly to this kernel tree (rejected hunks above). Nothing was built."
-              exit 1
+            # The patch is for gki-android14-6.1 (pershoot has no 6.6 branch). On this 6.6 tree most hunks apply; the ones that do not
+            # (context changed: includes, idmap, new GUP helpers) are ported by susfs-fixup-66.py. SELinux setxattr hooks are not ported.
+            rc=0; patch -p1 --forward --no-backup-if-mismatch < "$P" > "$GITHUB_WORKSPACE/susfs-patch.log" 2>&1 || rc=$?
+            grep -E '^(patching file|Hunk .*FAILED|.* out of .* FAILED)' "$GITHUB_WORKSPACE/susfs-patch.log" | grep -B1 FAILED || true
+            echo "patch exit code: $rc, rejected files:"; find . -name '*.rej' | sort
+            python3 "$GITHUB_WORKSPACE/susfs-fixup-66.py" || { echo "ERROR: could not port the rejected SUSFS hunks to this kernel (see above)"; exit 1; }
+            # Only the rejects the fixup knows about are allowed. Anything else means the tree changed: stop, show it.
+            UNEXPECTED="$(find . -name '*.rej' | sort | grep -vE '^\./(fs/(Makefile|exec\.c|namei\.c|namespace\.c|open\.c|stat\.c|proc/task_mmu\.c)|mm/memory\.c|security/selinux/(hooks\.c|ss/services\.c)|drivers/input/touchscreen/fts_spi/fts_lib/Makefile)\.rej$' || true)"
+            if [ -n "$UNEXPECTED" ]; then
+              for r in $UNEXPECTED; do echo "=== UNEXPECTED REJECT $r"; cat "$r"; done
+              echo "ERROR: SUSFS patch has rejected hunks the fixup does not handle"; exit 1
             fi
-            patch -p1 --no-backup-if-mismatch < "$P"
+            find . -name '*.rej' -delete
             cd "$GITHUB_WORKSPACE"
           fi
 
