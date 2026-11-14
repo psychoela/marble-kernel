@@ -588,6 +588,9 @@ jobs:
               echo "ERROR: SUSFS patch has rejected hunks the fixup does not handle"; exit 1
             fi
             find . -name '*.rej' -delete
+            # Diagnostics: what the SUSFS patch changed in the files that are known to differ on 6.6
+            git diff --stat | tail -40 || true
+            git diff -U3 -- security/selinux/hooks.c fs/namespace.c security/selinux/ss/services.c || true
             cd "$GITHUB_WORKSPACE"
           fi
 
@@ -756,9 +759,9 @@ jobs:
           MONPID=$!
           . /w/finasu-sig.env
           echo "manager certificate args: $FINASU_SIG_ARGS"
-          if ! make -j"$(nproc)" $MK $FINASU_SIG_ARGS KBUILD_BUILD_USER=PsychoAvy KBUILD_BUILD_HOST=github Image > ../build.log 2>&1; then
+          if ! make -k -j"$(nproc)" $MK $FINASU_SIG_ARGS KBUILD_BUILD_USER=PsychoAvy KBUILD_BUILD_HOST=github Image > ../build.log 2>&1; then
             echo "BUILD FAILED, errors:"
-            grep -nE 'error|Error' ../build.log | head -60 || true
+            grep -nE 'error:|undefined|Error [0-9]' ../build.log | grep -v '^[0-9]*:  *[A-Z]* ' | head -250 || true
             if grep -q 'with_policy' ../build.log; then echo "HINT: undefined *_with_policy symbols with built-in SUSFS on 6.6, see KernelSU-Next issue 1622"; fi
             echo "last 60 lines:"; tail -60 ../build.log
             exit 1
