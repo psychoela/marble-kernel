@@ -54,7 +54,9 @@ env:
   # (branch gki-android15-6.6), the root side from the dev-susfs branch of KernelSU-Next, which already
   # contains the SUSFS changes. SUSFS_SHA "" = tip of SUSFS_BRANCH. Put a commit SHA to pin.
   SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
-  SUSFS_BRANCH: gki-android15-6.6
+  # gki-android15-6.6 is SUSFS 2.3.0 and is too old for the dev-susfs branch of KernelSU-Next (build 1 failed with
+  # "undeclared function susfs_parse_sus_path_app_strings"), so the -dev branch is used. Change it back if needed.
+  SUSFS_BRANCH: gki-android15-6.6-dev
   SUSFS_SHA: ""
   KSUN_SUSFS_REPO: https://github.com/pershoot/KernelSU-Next
   KSUN_SUSFS_BRANCH: dev-susfs
@@ -481,6 +483,23 @@ jobs:
           add_source "$K/drivers/Kconfig" 'source "drivers/kernelsu/Kconfig"'
 
           grep -n kernelsu "$K/drivers/Makefile" "$K/drivers/Kconfig"
+
+          # Built-in SUSFS: warn early if the root side calls susfs_* functions that the SUSFS kernel side does not
+          # declare or define (that is what stops the build at compile time, minutes later).
+          if [ "$WITH_SUSFS" = true ]; then
+            MISSING=""
+            for fn in $(grep -rhoE '\bsusfs_[a-z0-9_]+ *\(' "$K/$ROOT_DIR/kernel" --include='*.c' --include='*.h' | tr -d ' (' | sort -u); do
+              if grep -qE "\b$fn\b" "$K"/include/linux/susfs*.h "$K"/fs/susfs.c 2>/dev/null; then continue; fi
+              if grep -rqE "^[A-Za-z_][A-Za-z0-9_ \*]* \*?$fn *\(" "$K/$ROOT_DIR/kernel" --include='*.c' --include='*.h' 2>/dev/null; then continue; fi
+              MISSING="$MISSING $fn"
+            done
+            if [ -n "$MISSING" ]; then
+              echo "WARNING: KernelSU-Next calls these susfs functions that the SUSFS kernel side ($SUSFS_BRANCH) does not provide:$MISSING"
+              echo "WARNING: the build will most likely fail. Use a SUSFS branch/commit that matches the KernelSU-Next branch."
+            else
+              echo "SUSFS check: every susfs_* function used by KernelSU-Next is provided by the SUSFS kernel side"
+            fi
+          fi
 
       - name: Silence compiler warnings inside the root solution only
         run: |
