@@ -588,6 +588,15 @@ jobs:
               echo "ERROR: SUSFS patch has rejected hunks the fixup does not handle"; exit 1
             fi
             find . -name '*.rej' -delete
+            # 6.6 port of what applied "cleanly" but carries 6.1 code:
+            # 1) fs/namespace.c: the extra alloc_vfsmnt() copies set mnt_userns; 6.6 uses mnt_idmap
+            sed -i 's/mnt->mnt\.mnt_userns = &init_user_ns;/mnt->mnt.mnt_idmap = \&nop_mnt_idmap;/' fs/namespace.c
+            if grep -n 'mnt_userns' fs/namespace.c; then echo 'ERROR: mnt_userns still in fs/namespace.c'; exit 1; fi
+            # 2) security/selinux: the whole SUSFS SELinux layer (hooks.c, selinuxfs.c, status.c, ss/services.c) is written
+            #    for the 6.1 selinux_state API and breaks the 6.6 build (about 20 errors). It is reverted, so the SELinux
+            #    context hiding part of SUSFS is not active in this build.
+            git checkout -- security/selinux
+            git status --short security/selinux | head
             # Diagnostics: what the SUSFS patch changed in the files that are known to differ on 6.6
             git diff --stat | tail -40 || true
             git diff -U3 -- security/selinux/hooks.c fs/namespace.c security/selinux/ss/services.c || true
