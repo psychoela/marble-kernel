@@ -25,6 +25,10 @@ on:
         description: "Build fgetpriority (aerath-stuff/fgetpriority, getpriority hiding helper for HMA) into the kernel"
         type: boolean
         default: true
+      with_susfs:
+        description: "Build SUSFS into the kernel (built-in). Needs root_choice = kernelsu-next, uses its dev-susfs branch and replaces the SUSFS LKM. Off = same build as before"
+        type: boolean
+        default: false
       publish_release:
         description: "Also publish the zip as a GitHub Release (does not use artifact storage)"
         type: boolean
@@ -46,6 +50,15 @@ env:
   FGP_REPO: https://github.com/aerath-stuff/fgetpriority
   FGP_BRANCH: master
   FGP_SHA: ""
+  # Built-in SUSFS, used when with_susfs is on. The kernel side patch comes from simonpunk's susfs4ksu
+  # (branch gki-android15-6.6), the root side from the dev-susfs branch of KernelSU-Next, which already
+  # contains the SUSFS changes. SUSFS_SHA "" = tip of SUSFS_BRANCH. Put a commit SHA to pin.
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
+  SUSFS_BRANCH: gki-android15-6.6
+  SUSFS_SHA: ""
+  KSUN_SUSFS_REPO: https://github.com/pershoot/KernelSU-Next
+  KSUN_SUSFS_BRANCH: dev-susfs
+  KSUN_SUSFS_SHA: ""
   # FinaSU (LyraVoid/FinaSU, a KernelSU fork). FINASU_BRANCH "latest" = newest GitHub release tag.
   # The release APK of the SAME tag is used for the manager certificate, so kernel and manager match.
   FINASU_REPO: https://github.com/LyraVoid/FinaSU
@@ -120,8 +133,13 @@ jobs:
       - name: Select root solution (FinaSU or KernelSU-Next)
         env:
           ROOT_CHOICE: ${{ inputs.root_choice }}
+          WITH_SUSFS: ${{ inputs.with_susfs }}
         run: |
           set -eu
+          if [ "$WITH_SUSFS" = true ] && [ "$ROOT_CHOICE" != kernelsu-next ]; then
+            echo "ERROR: with_susfs needs root_choice = kernelsu-next (FinaSU has no built-in SUSFS support here)"
+            exit 1
+          fi
           # ROOT_* = the root solution this build uses. ROOT_DIR is the folder name inside the kernel tree.
           # FINASU_BRANCH may already have been replaced by the newest tag in the step above.
           if [ "$ROOT_CHOICE" = kernelsu-next ]; then
@@ -133,7 +151,11 @@ jobs:
             { echo "ROOT_NAME=FinaSU"; echo "ROOT_DIR=FinaSU"; echo "ROOT_REPO=$FINASU_REPO"
               echo "ROOT_REF=$FB"; echo "ROOT_SHA=$FINASU_SHA"; } >> "$GITHUB_ENV"
           fi
-          echo "root solution: $ROOT_CHOICE"
+          if [ "$WITH_SUSFS" = true ]; then
+            # built-in SUSFS: use the KernelSU-Next branch that already has the SUSFS changes
+            { echo "ROOT_REPO=$KSUN_SUSFS_REPO"; echo "ROOT_REF=$KSUN_SUSFS_BRANCH"; echo "ROOT_SHA=$KSUN_SUSFS_SHA"; } >> "$GITHUB_ENV"
+          fi
+          echo "root solution: $ROOT_CHOICE (built-in SUSFS: $WITH_SUSFS)"
           grep '^ROOT_' "$GITHUB_ENV"
 
       - name: Check that config6_6.txt is the phone's real 6.6 kernel config
@@ -345,6 +367,7 @@ jobs:
         env:
           WITH_NOMOUNT: ${{ inputs.with_nomount }}
           WITH_FGP: ${{ inputs.with_fgetpriority }}
+          WITH_SUSFS: ${{ inputs.with_susfs }}
         run: |
           set -eux
           fetch_sha() { # url sha-or-branch dir
@@ -365,6 +388,12 @@ jobs:
             git -C fgetpriority log -1 --format='fgetpriority %H %s'
             find fgetpriority -path fgetpriority/.git -prune -o -type f -print | head -50
           fi
+          if [ "$WITH_SUSFS" = true ]; then
+            fetch_sha "$SUSFS_REPO" "${SUSFS_SHA:-$SUSFS_BRANCH}" susfs
+            git -C susfs log -1 --format='susfs %H %s'
+            ls -la susfs/kernel_patches susfs/kernel_patches/fs susfs/kernel_patches/include/linux
+            test -f susfs/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch || { echo "ERROR: 50_add_susfs_in_gki-android15-6.6.patch not found in $SUSFS_BRANCH"; exit 1; }
+          fi
           # Root solution (FinaSU or KernelSU-Next): full history, its version number is computed from commit count.
           # ROOT_REF can be a branch or a release tag.
           git clone -q --branch "$ROOT_REF" "$ROOT_REPO" rootsu
@@ -380,6 +409,7 @@ jobs:
         env:
           WITH_NOMOUNT: ${{ inputs.with_nomount }}
           WITH_FGP: ${{ inputs.with_fgetpriority }}
+          WITH_SUSFS: ${{ inputs.with_susfs }}
         run: |
           set -eux
           K="$PWD/kernel"
@@ -427,6 +457,22 @@ jobs:
             cat fgp.config
           fi
 
+          # Built-in SUSFS: copy its fs/ and include/ files, then apply the kernel patch for gki-android15-6.6.
+          # The root side is already inside the dev-susfs branch of KernelSU-Next, so 10_enable_susfs_for_ksu.patch is not used.
+          if [ "$WITH_SUSFS" = true ]; then
+            P="$GITHUB_WORKSPACE/susfs/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch"
+            cp -rf susfs/kernel_patches/fs/. "$K/fs/"
+            cp -rf susfs/kernel_patches/include/linux/. "$K/include/linux/"
+            cd "$K"
+            if ! patch -p1 --dry-run --no-backup-if-mismatch < "$P" > "$GITHUB_WORKSPACE/susfs-dryrun.log" 2>&1; then
+              cat "$GITHUB_WORKSPACE/susfs-dryrun.log"
+              echo "ERROR: the SUSFS kernel patch does not apply cleanly to this kernel tree (failed hunks above). Nothing was built."
+              exit 1
+            fi
+            patch -p1 --no-backup-if-mismatch < "$P"
+            cd "$GITHUB_WORKSPACE"
+          fi
+
           # Root solution (FinaSU or KernelSU-Next): keep it a git repo inside the tree,
           # symlink like KernelSU's setup.sh does
           mv rootsu "$K/$ROOT_DIR"
@@ -450,7 +496,7 @@ jobs:
           tail -5 "$K/$ROOT_DIR/kernel/Kbuild"
 
       - name: Provide __stack_chk_guard for the SUSFS LKM
-        if: env.ENABLE_SUSFS_LKM == '1'
+        if: env.ENABLE_SUSFS_LKM == '1' && !inputs.with_susfs
         run: |
           set -eux
           K="$PWD/kernel"
@@ -524,10 +570,12 @@ jobs:
           mkdir -p out
           cp ../config6_6.txt out/.config
           printf 'CONFIG_KSU=y\n' >> out/.config
+          if [ "${WITH_SUSFS:-false}" = true ]; then printf 'CONFIG_KSU_SUSFS=y\n' >> out/.config; fi
           if [ -s /w/fgp.config ]; then cat /w/fgp.config >> out/.config; fi
           if [ "${WITH_NOMOUNT:-false}" = true ]; then printf 'CONFIG_NOMOUNT=y\n' >> out/.config; fi
           # Use tracepoint hook mode when this KernelSU fork offers it (ignored otherwise)
-          if grep -rqE 'config KSU_TRACEPOINT_HOOK' "/w/kernel/$ROOT_DIR/kernel" --include='Kconfig*'; then
+          # (not with built-in SUSFS: it brings its own inline hooks)
+          if [ "${WITH_SUSFS:-false}" != true ] && grep -rqE 'config KSU_TRACEPOINT_HOOK' "/w/kernel/$ROOT_DIR/kernel" --include='Kconfig*'; then
             echo 'CONFIG_KSU_TRACEPOINT_HOOK=y' >> out/.config
           fi
           # TCP BBR + Westwood (+ fq qdisc, which BBR works best with). Selectable at runtime; the default stays cubic.
@@ -551,6 +599,7 @@ jobs:
           grep -E '^CONFIG_(TCP_CONG_BBR|TCP_CONG_WESTWOOD|NET_SCH_FQ|NET_SCH_FQ_CODEL|NET_SCH_CAKE|NETFILTER_XT_TARGET_HL|WIREGUARD|KSU|NOMOUNT|KEYS|LTO_NONE|CFI_CLANG|SHADOW_CALL_STACK|MODVERSIONS|DEBUG_INFO_BTF|TRIM_UNUSED_KSYMS|MODULE_SIG_PROTECT|MODULES|MODULE_UNLOAD|MODULE_FORCE_LOAD|KALLSYMS|KALLSYMS_ALL|KPROBES|LOCALVERSION|DEBUG_INFO|DEBUG_INFO_BTF)=' out/.config || true
           # These must survive olddefconfig, otherwise vendor modules will not load
           grep -q '^CONFIG_KSU=y' out/.config
+          if [ "${WITH_SUSFS:-false}" = true ]; then grep -q '^CONFIG_KSU_SUSFS=y' out/.config || { echo "ERROR: CONFIG_KSU_SUSFS did not survive olddefconfig (not offered by this KernelSU-Next branch, or a dependency is missing)"; exit 1; }; fi
           if [ "${WITH_NOMOUNT:-false}" = true ]; then grep -q '^CONFIG_NOMOUNT=y' out/.config; fi
           if [ -s /w/fgp.config ]; then grep -qxF "$(cat /w/fgp.config)" out/.config || { echo "ERROR: $(cat /w/fgp.config) did not survive olddefconfig (missing dependency?)"; exit 1; }; fi
           grep -q '^CONFIG_MODULES=y' out/.config
@@ -575,6 +624,7 @@ jobs:
           if ! make -j"$(nproc)" $MK $FINASU_SIG_ARGS KBUILD_BUILD_USER=PsychoAvy KBUILD_BUILD_HOST=github Image > ../build.log 2>&1; then
             echo "BUILD FAILED, errors:"
             grep -nE 'error|Error' ../build.log | head -60 || true
+            if grep -q 'with_policy' ../build.log; then echo "HINT: undefined *_with_policy symbols with built-in SUSFS on 6.6, see KernelSU-Next issue 1622"; fi
             echo "last 60 lines:"; tail -60 ../build.log
             exit 1
           fi
@@ -603,7 +653,13 @@ jobs:
           if [ "${ENABLE_SUSFS_LKM:-0}" = 1 ]; then
             grep -E ' [A-Za-z] __stack_chk_guard$' System.map || echo "WARNING: __stack_chk_guard is not in System.map, the SUSFS LKM will fail to load"
           fi
-          echo "susfs symbols (informational, 0 is expected: SUSFS comes from the LKM module you installed): $(grep -ciE 'susfs' System.map)"
+          SUSFS_SYMS="$(grep -ciE 'susfs' System.map || true)"
+          if [ "${WITH_SUSFS:-false}" = true ]; then
+            echo "susfs symbols: $SUSFS_SYMS"
+            [ "$SUSFS_SYMS" -gt 0 ] || { echo "ERROR: SUSFS is on but there are no susfs symbols in System.map"; exit 1; }
+          else
+            echo "susfs symbols (informational, 0 is expected: SUSFS comes from the LKM module you installed): $SUSFS_SYMS"
+          fi
           grep -iE 'FinaSU|KernelSU|Hook mode' ../../build.log | head -20 || true
           ls -la arch/arm64/boot/Image
 
@@ -623,6 +679,7 @@ jobs:
         env:
           CLANG_CHOICE: ${{ inputs.clang_choice }}
           WITH_NOMOUNT: ${{ inputs.with_nomount }}
+          WITH_SUSFS: ${{ inputs.with_susfs }}
         run: |
           set -eux
           IMG="$BUILD_IMAGE"
@@ -633,7 +690,8 @@ jobs:
             -e PHONE_BASE_VERSION="$PHONE_BASE_VERSION" \
             -e ROOT_NAME="$ROOT_NAME" \
             -e ROOT_DIR="$ROOT_DIR" \
-            -e ENABLE_SUSFS_LKM="$ENABLE_SUSFS_LKM" \
+            -e ENABLE_SUSFS_LKM="$( [ "$WITH_SUSFS" = true ] && echo 0 || echo "$ENABLE_SUSFS_LKM" )" \
+            -e WITH_SUSFS="$WITH_SUSFS" \
             -e WITH_NOMOUNT="$WITH_NOMOUNT" \
             -e MODULE_SIG_PROTECT_OFF="$MODULE_SIG_PROTECT_OFF" \
             -v "$PWD":/w \
@@ -653,10 +711,12 @@ jobs:
           ROOT_CHOICE: ${{ inputs.root_choice }}
           WITH_NOMOUNT: ${{ inputs.with_nomount }}
           WITH_FGP: ${{ inputs.with_fgetpriority }}
+          WITH_SUSFS: ${{ inputs.with_susfs }}
         run: |
           set -eux
           NM=""; [ "$WITH_NOMOUNT" = true ] && NM="-nomount"
           [ "$WITH_FGP" = true ] && NM="$NM-fgp"
+          [ "$WITH_SUSFS" = true ] && NM="$NM-susfs"
           if [ "$ROOT_CHOICE" = kernelsu-next ]; then ZIP_NAME="marble-6.6-ksunext$NM.zip"; else ZIP_NAME="marble-6.6-finasu$NM.zip"; fi
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
           test -f kernel/out/arch/arm64/boot/Image
@@ -696,6 +756,7 @@ jobs:
           EOF
           LABEL="$ROOT_NAME"; [ "$WITH_NOMOUNT" = true ] && LABEL="NoMount + $ROOT_NAME"
           [ "$WITH_FGP" = true ] && LABEL="$LABEL + fgetpriority"
+          [ "$WITH_SUSFS" = true ] && LABEL="$LABEL + SUSFS"
           sed -i "s/ROOTLABEL/$LABEL/g" anykernel.sh
           cp ../kernel/out/arch/arm64/boot/Image Image
           zip -qr9 "../$ZIP_NAME" .
@@ -710,6 +771,7 @@ jobs:
           CLANG_CHOICE: ${{ inputs.clang_choice }}
           WITH_NOMOUNT: ${{ inputs.with_nomount }}
           WITH_FGP: ${{ inputs.with_fgetpriority }}
+          WITH_SUSFS: ${{ inputs.with_susfs }}
         run: |
           set -eu
           TAG="build-66-${{ github.run_number }}"
@@ -754,6 +816,10 @@ jobs:
               FSHA="$(git -C fgetpriority rev-parse HEAD 2>/dev/null || echo unknown)"
               echo "- **fgetpriority:** built in · ref \`${FGP_BRANCH}\` · [\`$(echo "$FSHA" | cut -c1-7)\`](${FGP_REPO}/commit/${FSHA})"
             fi
+            if [ "$WITH_SUSFS" = true ]; then
+              SSHA="$(git -C susfs rev-parse HEAD 2>/dev/null || echo unknown)"
+              echo "- **SUSFS:** built in (kernel side, branch \`${SUSFS_BRANCH}\`) · [\`$(echo "$SSHA" | cut -c1-7)\`](${SUSFS_REPO}/-/commit/${SSHA}) · do not load the SUSFS LKM"
+            fi
             echo "- **Clang:** \`${CLANG_VER}\` · ${LTO} · ${CFI} · choice \`${CLANG_CHOICE}\`"
             echo "- **Commit:** [\`${KSHORT}\`](${KERNEL_REPO}/commit/${KSHA}) · ${KSUBJ}"
             echo "- **Base:** [psychoela/marble-kernel-x](${KERNEL_REPO}), branch \`${KERNEL_BRANCH}\`"
@@ -774,7 +840,7 @@ jobs:
           gh release create "$TAG" "$ZIP" Image SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "marble ${KVER} ${ROOT_NAME}$( [ "$WITH_NOMOUNT" = true ] && echo ' + NoMount')$( [ "$WITH_FGP" = true ] && echo ' + fgetpriority')" \
+            --title "marble ${KVER} ${ROOT_NAME}$( [ "$WITH_NOMOUNT" = true ] && echo ' + NoMount')$( [ "$WITH_FGP" = true ] && echo ' + fgetpriority')$( [ "$WITH_SUSFS" = true ] && echo ' + SUSFS')" \
             --notes-file release-notes.md \
             --prerelease
 
