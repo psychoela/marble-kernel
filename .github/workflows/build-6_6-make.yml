@@ -38,7 +38,7 @@ env:
   # Your fork of Evolution-X kernel_xiaomi_sm8450, branch cnb-6.6 (Android 15 GKI 6.6).
   # KERNEL_SHA "" = tip of KERNEL_BRANCH (the commit is printed in the log). To pin, put a commit SHA here.
   KERNEL_REPO: https://github.com/psychoela/marble-kernel-x
-  KERNEL_BRANCH: sync-upstream
+  KERNEL_BRANCH: cnb-6.6
   KERNEL_SHA: ""
   # NoMount (maxsteeel/nomount), used when with_nomount is on. NOMOUNT_BRANCH "latest" = newest GitHub release
   # tag (auto-detected), falling back to the newest tag, then master. Put a fixed tag here to pin.
