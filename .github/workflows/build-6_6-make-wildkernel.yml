@@ -67,7 +67,7 @@ env:
   SUSFS_PATCH_GLOB: "50_add_susfs_in_gki-android15-6.6*.patch"
   SUSFS_SHA: ""
   SUSFS_EXTRA_REPO: https://gitlab.com/pershoot/susfs4ksu
-  SUSFS_CHERRY_PICKS: "b04fd36 61bc01a"
+  SUSFS_CHERRY_PICKS: ""
   KSUN_SUSFS_REPO: https://github.com/pershoot/KernelSU-Next
   KSUN_SUSFS_BRANCH: dev-susfs
   KSUN_SUSFS_SHA: ""
@@ -496,6 +496,8 @@ jobs:
             cp -rf susfs/kernel_patches/fs/. "$K/fs/"
             cp -rf susfs/kernel_patches/include/linux/. "$K/include/linux/"
             cd "$K"
+            # the kernel repo already contains a stray drivers/input/touchscreen/fts_spi/fts_lib/Makefile.rej: remember what exists before patching
+            find . -name '*.rej' | sort > "$GITHUB_WORKSPACE/rej-before.txt"
             # dry run first: nothing is modified unless every hunk applies
             rc=0; patch -p1 --forward --dry-run < "$P" > "$GITHUB_WORKSPACE/susfs-patch-dry.log" 2>&1 || rc=$?
             if [ "$rc" != 0 ]; then
@@ -507,7 +509,9 @@ jobs:
             fi
             patch -p1 --forward --no-backup-if-mismatch < "$P" > "$GITHUB_WORKSPACE/susfs-patch.log" 2>&1
             echo "SUSFS patch applied, files touched: $(grep -c '^patching file' "$GITHUB_WORKSPACE/susfs-patch.log")"
-            if [ -n "$(find . -name '*.rej')" ]; then find . -name '*.rej'; echo "ERROR: rejected hunks"; exit 1; fi
+            find . -name '*.rej' | sort > "$GITHUB_WORKSPACE/rej-after.txt"
+            NEWREJ="$(comm -13 "$GITHUB_WORKSPACE/rej-before.txt" "$GITHUB_WORKSPACE/rej-after.txt")"
+            if [ -n "$NEWREJ" ] || grep -q 'FAILED' "$GITHUB_WORKSPACE/susfs-patch.log"; then echo "$NEWREJ"; echo "ERROR: SUSFS patch produced rejected hunks"; exit 1; fi
             # 6.6 uses mnt_idmap, 6.1 used mnt_userns. The native 6.6 patch should not contain it; fail early if it does.
             if grep -n 'mnt\.mnt_userns' fs/namespace.c; then echo 'ERROR: vfsmount.mnt_userns still used in fs/namespace.c'; exit 1; fi
             git diff --stat | tail -40 || true
