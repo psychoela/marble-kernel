@@ -50,19 +50,24 @@ env:
   FGP_REPO: https://github.com/aerath-stuff/fgetpriority
   FGP_BRANCH: master
   FGP_SHA: ""
-  # Built-in SUSFS, used when with_susfs is on. The root side is the dev-susfs branch of pershoot/KernelSU-Next, which
-  # carries SUSFS v2.4.0 and calls functions (susfs_parse_sus_path_app_strings, susfs_kstat_gate_allowed, ...) that
-  # simonpunk's susfs4ksu (v2.3.0) does not have. Builds 1 and 2 failed on that ("call to undeclared function
-  # susfs_parse_sus_path_app_strings"). The matching kernel side is pershoot's own susfs4ksu fork, the one named in
-  # the commit message of "kernel: susfs (v2.4.0): Introduce SuSFS" in KernelSU-Next dev-susfs. Build 3 showed that
-  # this fork has ONLY 6.1 branches (gki-android14-6.1*, aosp-android14-6.1*, master), no 6.6 one. So the 6.1-dev
-  # branch is used and its 6.1 kernel patch is tried on this 6.6 tree (dry run first; failed hunks are printed
-  # and nothing is built if it does not apply). SUSFS_PATCH_GLOB picks the patch file inside kernel_patches/.
-  # SUSFS_SHA "" = tip of SUSFS_BRANCH. Put a commit SHA to pin.
-  SUSFS_REPO: https://gitlab.com/pershoot/susfs4ksu
-  SUSFS_BRANCH: gki-android14-6.1-dev
-  SUSFS_PATCH_GLOB: "50_add_susfs_in_gki-android14-6.1*.patch"
+  # Built-in SUSFS, used when with_susfs is on. This follows the recipe WildKernels use for their 6.6 builds:
+  #  - root side: the dev-susfs branch of pershoot/KernelSU-Next (SUSFS is already integrated there, so
+  #    10_enable_susfs_for_ksu.patch is NOT used)
+  #  - kernel side: simonpunk/susfs4ksu branch gki-android15-6.6, which has a NATIVE 6.6 kernel patch. This replaces the
+  #    old approach (6.1 patch from pershoot's fork + susfs-fixup-66.py + reverting the SELinux layer). The SELinux part of SUSFS
+  #    is now applied, which dev-susfs needs (its sepolicy.c calls susfs_add_sus_type and friends).
+  # SUSFS_CHERRY_PICKS: commits of pershoot/susfs4ksu (SUSFS_EXTRA_REPO) applied on top of the simonpunk branch, to keep it in step
+  # with dev-susfs. The hashes are the ones WildKernels' Samsung 6.6 build used (their issue #87); each one is skipped with a
+  # WARNING if it is not found or does not apply. Set "" to use plain simonpunk.
+  # Known: dev-susfs and simonpunk's branch can drift apart (WildKernels issue #87: KSUN 33405 built, KSUN 33452 failed with
+  # undefined susfs_add_sus_type). If that happens, pin KSUN_SUSFS_SHA to an older dev-susfs commit.
+  # SUSFS_SHA "" = tip of SUSFS_BRANCH. Put a full commit SHA to pin.
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
+  SUSFS_BRANCH: gki-android15-6.6
+  SUSFS_PATCH_GLOB: "50_add_susfs_in_gki-android15-6.6*.patch"
   SUSFS_SHA: ""
+  SUSFS_EXTRA_REPO: https://gitlab.com/pershoot/susfs4ksu
+  SUSFS_CHERRY_PICKS: ""
   KSUN_SUSFS_REPO: https://github.com/pershoot/KernelSU-Next
   KSUN_SUSFS_BRANCH: dev-susfs
   KSUN_SUSFS_SHA: ""
@@ -402,6 +407,23 @@ jobs:
             git -C susfs log -1 --format='susfs %H %s'
             ls -la susfs/kernel_patches susfs/kernel_patches/fs susfs/kernel_patches/include/linux
             ls susfs/kernel_patches/$SUSFS_PATCH_GLOB || { echo "ERROR: no $SUSFS_PATCH_GLOB in $SUSFS_BRANCH of $SUSFS_REPO"; exit 1; }
+            if [ -n "$SUSFS_CHERRY_PICKS" ]; then
+              git clone -q --filter=blob:none --no-checkout "$SUSFS_EXTRA_REPO" susfs-extra || echo "WARNING: cannot clone $SUSFS_EXTRA_REPO, cherry-picks skipped"
+              if [ -d susfs-extra ]; then
+                for c in $SUSFS_CHERRY_PICKS; do
+                  if git -C susfs-extra format-patch -1 --stdout "$c" > "susfs-pick-$c.patch" 2>/dev/null && [ -s "susfs-pick-$c.patch" ]; then
+                    if git -C susfs apply --check "../susfs-pick-$c.patch" 2> susfs-pick-err.log; then
+                      git -C susfs apply "../susfs-pick-$c.patch"
+                      echo "cherry-picked $c: $(git -C susfs-extra log -1 --format=%s "$c")"
+                    else
+                      echo "WARNING: cherry-pick $c does not apply on $SUSFS_BRANCH, skipped:"; cat susfs-pick-err.log
+                    fi
+                  else
+                    echo "WARNING: commit $c not found in $SUSFS_EXTRA_REPO, skipped"
+                  fi
+                done
+              fi
+            fi
           fi
           # Root solution (FinaSU or KernelSU-Next): full history, its version number is computed from commit count.
           # ROOT_REF can be a branch or a release tag.
@@ -422,107 +444,6 @@ jobs:
         run: |
           set -eux
           K="$PWD/kernel"
-          cat > susfs-fixup-66.py <<'PYEOF'
-          #!/usr/bin/env python3
-          """Port the SUSFS (gki-android14-6.1) hunks that do not apply to a 6.6 tree. Run inside the kernel tree.
-          Every edit needs its anchor to exist exactly once (or the edit to be already present); otherwise it exits 1."""
-          import sys
-
-          def edit(path, old, new, mode="after", marker=None):
-              s = open(path).read()
-              if (marker or new) in s:
-                  print("already present:", path, (marker or new)[:50].strip()); return
-              if s.count(old) != 1:
-                  sys.exit("ANCHOR NOT FOUND exactly once in %s: %r (found %d)" % (path, old[:70], s.count(old)))
-              s = s.replace(old, old + new if mode == "after" else (new + old if mode == "before" else new))
-              open(path, "w").write(s); print("ok:", path)
-
-          INC = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n"
-          # fs/Makefile: new object
-          s = open("fs/Makefile").read()
-          if "susfs.o" not in s:
-              open("fs/Makefile", "a").write("\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n"); print("ok: fs/Makefile")
-          # include hunks whose context differs on 6.6
-          edit("fs/exec.c", "#include <linux/page_size_compat.h>\n", INC)
-          edit("fs/open.c", "#include <linux/filelock.h>\n", INC)
-          edit("mm/memory.c", "#include <linux/zswap.h>\n",
-               "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux/susfs_def.h>\n#endif\n")
-          edit("fs/namespace.c", "#include <linux/mnt_idmapping.h>\n",
-               "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n")
-          edit("fs/namespace.c", "#include <trace/hooks/fs.h>\n",
-               "\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\n"
-               "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n\n"
-               "#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\n#endif\n")
-          edit("security/selinux/ss/services.c", "#include <trace/hooks/selinux.h>\n",
-               "\n#ifdef CONFIG_KSU_SUSFS\nextern bool susfs_is_current_ksu_domain(void);\n"
-               "extern bool susfs_is_sus_type_rcu(u32 sid);\n"
-               "extern void susfs_spoof_avd_allowed_rcu(u32 s_type, u32 t_type, u32 c_type, u32 *avd_allowed);\n#endif\n")
-          # mm/memory.c: __access_remote_vm (6.6 gets the vma from get_user_page_vma_remote)
-          edit("mm/memory.c",
-               "\t\tstruct page *page = get_user_page_vma_remote(mm, addr,\n\t\t\t\t\t\t\t     gup_flags, &vma);\n",
-               "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n\t\tif (!IS_ERR_OR_NULL(page) && vma && vma->vm_file &&\n"
-               "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))) {\n\t\t\tput_page(page);\n\t\t\tbreak;\n\t\t}\n#endif\n",
-               marker="SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))) {\n\t\t\tput_page")
-          # fs/proc/task_mmu.c: show_smaps_rollup
-          s = open("fs/proc/task_mmu.c").read()
-          a = "\t\t\t/* Case 4 above */\n\t\t\tif (vma->vm_end > last_vma_end) {\n\t\t\t\tsmap_gather_stats(vma, &mss, last_vma_end);\n"
-          b = ("\t\t\t/* Case 4 above */\n\t\t\tif (vma->vm_end > last_vma_end) {\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-               "\t\t\t\tif (!vma->vm_file || !(SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))\n#endif\n"
-               "\t\t\t\tsmap_gather_stats(vma, &mss, last_vma_end);\n")
-          if "SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file))))\n#endif\n\t\t\t\tsmap_gather_stats" not in s:
-              if s.count(a) != 1: sys.exit("ANCHOR NOT FOUND in fs/proc/task_mmu.c (show_smaps_rollup)")
-              open("fs/proc/task_mmu.c", "w").write(s.replace(a, b)); print("ok: fs/proc/task_mmu.c")
-          # fs/namei.c: do_tmpfile open-redirect (6.6: idmap based, same body otherwise)
-          s = open("fs/namei.c").read()
-          a = ("\t\tstruct file *file)\n{\n\tstruct path path;\n\tint error = path_lookupat(nd, flags | LOOKUP_DIRECTORY, &path);\n\n"
-               "\tif (unlikely(error))\n\t\treturn error;\n\terror = mnt_want_write(path.mnt);\n")
-          b = ("\t\tstruct file *file)\n{\n#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n\tint old_dfd = nd->dfd;\n"
-               "\tbool is_nd_state_root_preset = (nd->state & ND_ROOT_PRESET);\n\tstruct filename *fake_filename = NULL;\n#endif\n"
-               "\tstruct path path;\n\tint error = path_lookupat(nd, flags | LOOKUP_DIRECTORY, &path);\n\n"
-               "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n\tif ((likely(!error) && !is_nd_state_root_preset) &&\n"
-               "\t\tSUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(path.dentry->d_inode)) {\n"
-               "\t\tfake_filename = susfs_open_redirect_spoof_do_sys_openat(path.dentry->d_inode);\n"
-               "\t\tif (fake_filename && !IS_ERR(fake_filename)) {\n\t\t\tstruct path fake_path;\n\n"
-               "\t\t\terror = filename_lookup(old_dfd, fake_filename, flags | LOOKUP_DIRECTORY, &fake_path, NULL);\n"
-               "\t\t\tpath_put(&path);\n\t\t\tif (unlikely(error)) {\n\t\t\t\tputname(fake_filename);\n\t\t\t\treturn error;\n\t\t\t}\n"
-               "\t\t\tpath = fake_path;\n\t\t}\n\t}\n#endif\n"
-               "\tif (unlikely(error))\n\t\treturn error;\n\terror = mnt_want_write(path.mnt);\n")
-          if "old_dfd = nd->dfd;\n\tbool is_nd_state_root_preset" in s and "do_tmpfile" in s and "filename_lookup(old_dfd, fake_filename, flags | LOOKUP_DIRECTORY" in s:
-              print("already present: do_tmpfile")
-          else:
-              if s.count(a) != 1: sys.exit("ANCHOR NOT FOUND in fs/namei.c (do_tmpfile)")
-              open("fs/namei.c", "w").write(s.replace(a, b)); print("ok: fs/namei.c")
-          # fs/stat.c: vfs_getattr_nosec (6.6: idmap, generic_fillattr takes request_mask)
-          s = open("fs/stat.c").read()
-          a = ("\tidmap = mnt_idmap(path->mnt);\n\tif (inode->i_op->getattr)\n\t\treturn inode->i_op->getattr(idmap, path, stat,\n"
-               "\t\t\t\t\t    request_mask,\n\t\t\t\t\t    query_flags | AT_GETATTR_NOSEC);\n\n"
-               "\tgeneric_fillattr(idmap, request_mask, inode, stat);\n\treturn 0;\n}\n")
-          b = ("\tidmap = mnt_idmap(path->mnt);\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\tif (susfs_is_current_app_uid()) {\n\t\tbool is_fuse = false;\n"
-               "\t\tif (susfs_is_inode_sus_kstat(d_backing_inode(path->dentry), &is_fuse)) {\n\t\t\tif (!is_fuse) {\n"
-               "\t\t\t\tstat->mnt_id = real_mount(path->mnt)->mnt_id;\n\t\t\t\tstat->result_mask |= STATX_SUS_KSTAT;\n\t\t\t}\n"
-               "\t\t\tstat->mnt_id = real_mount(path->mnt)->mnt_id;\n\t\t\tstat->result_mask |= STATX_SUS_KSTAT_FUSE;\n\t\t}\n\t}\n#endif\n"
-               "\tif (inode->i_op->getattr)\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t{\n"
-               "\t\tint err = inode->i_op->getattr(idmap, path, stat, request_mask,\n\t\t\t\t\t       query_flags | AT_GETATTR_NOSEC);\n"
-               "\t\tif (!err) {\n\t\t\tif (stat->result_mask & STATX_SUS_KSTAT) {\n"
-               "\t\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT);\n\t\t\t\treturn err;\n\t\t\t}\n"
-               "\t\t\tif (stat->result_mask & STATX_SUS_KSTAT_FUSE) {\n"
-               "\t\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT_FUSE);\n\t\t\t\treturn err;\n\t\t\t}\n\t\t}\n"
-               "\t\treturn err;\n\t}\n"
-               "\tif (stat->result_mask & STATX_SUS_KSTAT) {\n\t\tgeneric_fillattr(idmap, request_mask, inode, stat);\n"
-               "\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT);\n\t\treturn 0;\n\t}\n"
-               "\tif (stat->result_mask & STATX_SUS_KSTAT_FUSE) {\n\t\tgeneric_fillattr(idmap, request_mask, inode, stat);\n"
-               "\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT_FUSE);\n\t\treturn 0;\n\t}\n#else\n"
-               "\t\treturn inode->i_op->getattr(idmap, path, stat,\n\t\t\t\t\t    request_mask,\n\t\t\t\t\t    query_flags | AT_GETATTR_NOSEC);\n#endif\n\n"
-               "\tgeneric_fillattr(idmap, request_mask, inode, stat);\n\treturn 0;\n}\n")
-          if "susfs_sus_kstat_spoof_generic_fillattr(inode, stat, STATX_SUS_KSTAT_FUSE);\n\t\treturn 0;" in s:
-              print("already present: stat.c")
-          else:
-              if s.count(a) != 1: sys.exit("ANCHOR NOT FOUND in fs/stat.c (vfs_getattr_nosec)")
-              open("fs/stat.c", "w").write(s.replace(a, b)); print("ok: fs/stat.c")
-          # security/selinux/hooks.c: the three setxattr hooks are NOT ported. The SUSFS patch wraps 6.1's
-          # security_context_to_sid(state, ...); on 6.6 those functions have no state argument. Skipped on purpose.
-          print("skipped (not ported): security/selinux/hooks.c setxattr hooks")
-          PYEOF
 
           add_source() { # file, line to insert before the last "endmenu"
             if ! grep -qF "$2" "$1"; then
@@ -567,7 +488,7 @@ jobs:
             cat fgp.config
           fi
 
-          # Built-in SUSFS: copy its fs/ and include/ files, then apply the kernel patch for gki-android15-6.6.
+          # Built-in SUSFS: copy its fs/ and include/ files, then apply the native gki-android15-6.6 kernel patch.
           # The root side is already inside the dev-susfs branch of KernelSU-Next, so 10_enable_susfs_for_ksu.patch is not used.
           if [ "$WITH_SUSFS" = true ]; then
             P="$(ls "$GITHUB_WORKSPACE"/susfs/kernel_patches/$SUSFS_PATCH_GLOB | head -n1)"
@@ -575,36 +496,25 @@ jobs:
             cp -rf susfs/kernel_patches/fs/. "$K/fs/"
             cp -rf susfs/kernel_patches/include/linux/. "$K/include/linux/"
             cd "$K"
-            # The patch is for gki-android14-6.1 (pershoot has no 6.6 branch). On this 6.6 tree most hunks apply; the ones that do not
-            # (context changed: includes, idmap, new GUP helpers) are ported by susfs-fixup-66.py. SELinux setxattr hooks are not ported.
-            rc=0; patch -p1 --forward --no-backup-if-mismatch < "$P" > "$GITHUB_WORKSPACE/susfs-patch.log" 2>&1 || rc=$?
-            grep -E '^(patching file|Hunk .*FAILED|.* out of .* FAILED)' "$GITHUB_WORKSPACE/susfs-patch.log" | grep -B1 FAILED || true
-            echo "patch exit code: $rc, rejected files:"; find . -name '*.rej' | sort
-            python3 "$GITHUB_WORKSPACE/susfs-fixup-66.py" || { echo "ERROR: could not port the rejected SUSFS hunks to this kernel (see above)"; exit 1; }
-            # Only the rejects the fixup knows about are allowed. Anything else means the tree changed: stop, show it.
-            UNEXPECTED="$(find . -name '*.rej' | sort | grep -vE '^\./(fs/(Makefile|exec\.c|namei\.c|namespace\.c|open\.c|stat\.c|proc/task_mmu\.c)|mm/memory\.c|security/selinux/(hooks\.c|ss/services\.c)|drivers/input/touchscreen/fts_spi/fts_lib/Makefile)\.rej$' || true)"
-            if [ -n "$UNEXPECTED" ]; then
-              for r in $UNEXPECTED; do echo "=== UNEXPECTED REJECT $r"; cat "$r"; done
-              echo "ERROR: SUSFS patch has rejected hunks the fixup does not handle"; exit 1
+            # the kernel repo already contains a stray drivers/input/touchscreen/fts_spi/fts_lib/Makefile.rej: remember what exists before patching
+            find . -name '*.rej' | sort > "$GITHUB_WORKSPACE/rej-before.txt"
+            # dry run first: nothing is modified unless every hunk applies
+            rc=0; patch -p1 --forward --dry-run < "$P" > "$GITHUB_WORKSPACE/susfs-patch-dry.log" 2>&1 || rc=$?
+            if [ "$rc" != 0 ]; then
+              echo "=== SUSFS patch does not apply to this tree (dry run). Failed hunks:"
+              grep -E '^(patching file|Hunk .*FAILED|.* out of .* FAILED)' "$GITHUB_WORKSPACE/susfs-patch-dry.log" | grep -B1 FAILED || true
+              tail -40 "$GITHUB_WORKSPACE/susfs-patch-dry.log"
+              echo "ERROR: $SUSFS_REPO $SUSFS_BRANCH does not apply to this kernel tree. Send me the log above."
+              exit 1
             fi
-            find . -name '*.rej' -delete
-            # 6.6 port of what applied "cleanly" but carries 6.1 code:
-            # 1) fs/namespace.c: the extra alloc_vfsmnt() copies set mnt_userns; 6.6 uses mnt_idmap
-            sed -i 's/mnt->mnt\.mnt_userns = &init_user_ns;/mnt->mnt.mnt_idmap = \&nop_mnt_idmap;/' fs/namespace.c
+            patch -p1 --forward --no-backup-if-mismatch < "$P" > "$GITHUB_WORKSPACE/susfs-patch.log" 2>&1
+            echo "SUSFS patch applied, files touched: $(grep -c '^patching file' "$GITHUB_WORKSPACE/susfs-patch.log")"
+            find . -name '*.rej' | sort > "$GITHUB_WORKSPACE/rej-after.txt"
+            NEWREJ="$(comm -13 "$GITHUB_WORKSPACE/rej-before.txt" "$GITHUB_WORKSPACE/rej-after.txt")"
+            if [ -n "$NEWREJ" ] || grep -q 'FAILED' "$GITHUB_WORKSPACE/susfs-patch.log"; then echo "$NEWREJ"; echo "ERROR: SUSFS patch produced rejected hunks"; exit 1; fi
+            # 6.6 uses mnt_idmap, 6.1 used mnt_userns. The native 6.6 patch should not contain it; fail early if it does.
             if grep -n 'mnt\.mnt_userns' fs/namespace.c; then echo 'ERROR: vfsmount.mnt_userns still used in fs/namespace.c'; exit 1; fi
-            # 2) security/selinux: the whole SUSFS SELinux layer (hooks.c, selinuxfs.c, status.c, ss/services.c) is written
-            #    for the 6.1 selinux_state API and breaks the 6.6 build (about 20 errors). It is reverted, so the SELinux
-            #    context hiding part of SUSFS is not active in this build.
-            # Diagnostics for porting the SELinux layer to 6.6 later (printed before it is reverted)
-            echo "=================== SELINUX-LAYER DIFF (for porting)"
-            git diff --stat -- security include/linux include/uapi | tail -30 || true
-            git diff -U3 -- security/selinux/selinuxfs.c security/selinux/status.c security/selinux/avc.c security/selinux/include || true
-            echo "=================== END SELINUX-LAYER DIFF"
-            git checkout -- security/selinux
-            git status --short security/selinux | head
-            # Diagnostics: what the SUSFS patch changed in the files that are known to differ on 6.6
             git diff --stat | tail -40 || true
-            git diff -U3 -- security/selinux/hooks.c fs/namespace.c security/selinux/ss/services.c || true
             cd "$GITHUB_WORKSPACE"
           fi
 
@@ -722,7 +632,7 @@ jobs:
           mkdir -p out
           cp ../config6_6.txt out/.config
           printf 'CONFIG_KSU=y\n' >> out/.config
-          if [ "${WITH_SUSFS:-false}" = true ]; then printf 'CONFIG_KSU_SUSFS=y\n' >> out/.config; fi
+          if [ "${WITH_SUSFS:-false}" = true ]; then printf 'CONFIG_KSU_SUSFS=y\nCONFIG_KSU_SUSFS_SUS_MAP=y\n' >> out/.config; fi
           if [ -s /w/fgp.config ]; then cat /w/fgp.config >> out/.config; fi
           if [ "${WITH_NOMOUNT:-false}" = true ]; then printf 'CONFIG_NOMOUNT=y\n' >> out/.config; fi
           # Use tracepoint hook mode when this KernelSU fork offers it (ignored otherwise)
