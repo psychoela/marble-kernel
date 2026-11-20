@@ -720,6 +720,9 @@ jobs:
             echo "$ROOT_NAME: no certificate pin, the default manager certificate is used (install the normal manager APK)"
           fi
           echo "ksu symbols: $(grep -ciE 'ksu' System.map)"
+          # CRCs of exported symbols (System.map leaves __crc_ out): used to compare builds for module ABI
+          { llvm-nm vmlinux | grep -E ' A __crc_' | sort > crc.txt; } || true
+          echo "exported symbol CRCs: $(wc -l < crc.txt)"
           if [ "${ENABLE_SUSFS_LKM:-0}" = 1 ]; then
             grep -E ' [A-Za-z] __stack_chk_guard$' System.map || echo "WARNING: __stack_chk_guard is not in System.map, the SUSFS LKM will fail to load"
           fi
@@ -930,4 +933,5 @@ jobs:
             build.log
             config.diff
             kernel/out/System.map
+            kernel/out/crc.txt
 
