@@ -16,7 +16,6 @@ on:
         default: rom-clang-r510928
         options:
           - rom-clang-r510928
-          - llvm-22.1.8
       with_nomount:
         description: "Build NoMount (maxsteeel/nomount) into the kernel"
         type: boolean
@@ -32,7 +31,7 @@ on:
       publish_release:
         description: "Also publish the zip as a GitHub Release (does not use artifact storage)"
         type: boolean
-        default: true
+        default: false
 
 env:
   # Your fork of Evolution-X kernel_xiaomi_sm8450, branch cnb-6.6 (Android 15 GKI 6.6).
@@ -349,30 +348,6 @@ jobs:
           bash fetch-clang.sh https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "$CLANG_DIR" "$HOME/clang"
           "$HOME/clang/bin/clang" --version
           "$HOME/clang/bin/clang" --version | grep -q "clang version $CLANG_MAJOR\." || { echo "Expected clang $CLANG_MAJOR but got something else. Check CLANG_DIR."; exit 1; }
-          du -sh "$HOME/clang"
-
-      - name: Download upstream LLVM 22.1.8
-        if: ${{ inputs.clang_choice == 'llvm-22.1.8' }}
-        run: |
-          set -eux
-          V=22.1.8
-          mkdir -p "$HOME/clang"
-          cd "$(mktemp -d)"
-          ok=0
-          for f in "LLVM-$V-Linux-X64.tar.xz" "clang+llvm-$V-x86_64-linux-gnu-ubuntu-22.04.tar.xz"; do
-            echo "-- trying $f"
-            if curl -fsSL --connect-timeout 30 --retry 3 --retry-all-errors -o clang.tar.xz \
-                 "https://github.com/llvm/llvm-project/releases/download/llvmorg-$V/$f"; then
-              ok=1; break
-            fi
-          done
-          [ "$ok" = 1 ] || { echo "ERROR: no prebuilt LLVM $V Linux x86_64 tarball found on the release page"; exit 1; }
-          tar -xJf clang.tar.xz -C "$HOME/clang" --strip-components=1
-          "$HOME/clang/bin/clang" --version
-          "$HOME/clang/bin/clang" --version | grep -q "clang version 22\.1\.8" || { echo "Expected clang 22.1.8"; exit 1; }
-          for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
-            test -x "$HOME/clang/bin/$t" || { echo "MISSING $t"; exit 1; }
-          done
           du -sh "$HOME/clang"
 
       - name: Fetch sources at pinned commits
@@ -921,4 +896,5 @@ jobs:
             release-notes.md
             build.log
             config.diff
+            kernel/out/System.map
 
