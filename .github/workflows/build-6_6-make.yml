@@ -16,6 +16,7 @@ on:
         default: rom-clang-r510928
         options:
           - rom-clang-r510928
+          - aosp-clang-r614150
       with_nomount:
         description: "Build NoMount (maxsteeel/nomount) into the kernel"
         type: boolean
@@ -82,8 +83,9 @@ env:
   # The ROM's own compiler (clang_choice = rom-clang-r510928). config6_6.txt says the ROM kernel was built with
   # "Android (11368308, +pgo, +bolt, +lto, +mlgo, based on r510928) clang version 18.0.0".
   # That is the AOSP prebuilt directory clang-r510928, downloaded from android.googlesource.com.
-  CLANG_DIR: clang-r510928
-  CLANG_MAJOR: "18"
+  # aosp-clang-r614150 = AOSP prebuilt clang 23.0.1 (same repo, directory clang-r614150). Default stays the ROM's r510928.
+  CLANG_DIR: ${{ inputs.clang_choice == 'aosp-clang-r614150' && 'clang-r614150' || 'clang-r510928' }}
+  CLANG_MAJOR: ${{ inputs.clang_choice == 'aosp-clang-r614150' && '23' || '18' }}
   # Release string. "" = auto: base version read from the kernel Makefile + LOCALVERSION_SUFFIX.
   EXPECTED_RELEASE: ""
   # Suffix of the ROM kernel release, as in `uname -r` on the phone. Evolution X 12.4 stock kernel is
@@ -292,8 +294,8 @@ jobs:
           free -g
           nproc
 
-      - name: Download the ROM's clang (AOSP clang-r510928)
-        if: ${{ inputs.clang_choice == 'rom-clang-r510928' }}
+      - name: Download the AOSP clang (clang_choice)
+        if: ${{ inputs.clang_choice == 'rom-clang-r510928' || inputs.clang_choice == 'aosp-clang-r614150' }}
         run: |
           set -eux
           cat > fetch-clang.sh <<'EOF'
