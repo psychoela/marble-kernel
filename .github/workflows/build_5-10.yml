@@ -768,7 +768,7 @@ jobs:
           apt-get install -y -qq --no-install-recommends \
             flex bison bc cpio libssl-dev libelf-dev xz-utils python3 binutils \
             make gcc g++ git ca-certificates curl python-is-python3 perl \
-            libxml2 libzstd1 zlib1g libtinfo6 ccache
+            libxml2 libzstd1 zlib1g libtinfo6 ccache procps
           head -2 /etc/os-release
           # repo is owned by another uid than root: let git (used by Kbuild) work anyway
           git config --global --add safe.directory '*'
@@ -959,7 +959,16 @@ jobs:
           IMG="$BUILD_IMAGE"
           case "$CLANG_CHOICE" in alchemist-*) IMG="$BUILD_IMAGE_ALCHEMIST" ;; esac
           echo "build image: $IMG"
+          # Cap the container just below RAM + swap. When the full-LTO link runs out of memory, the
+          # container is squeezed/killed instead of starving the runner agent itself (that was the
+          # "hosted runner lost communication with the server" failure).
+          RAM_MB="$(free -m | awk 'NR==2{print $2}')"
+          SWAP_MB="$(free -m | awk 'NR==3{print $2}')"
+          MEM_LIMIT=$(( RAM_MB - 1500 ))
+          MEMSWAP_LIMIT=$(( RAM_MB + SWAP_MB - 2000 ))
+          echo "container memory limit ${MEM_LIMIT}m, with swap ${MEMSWAP_LIMIT}m"
           docker run --rm \
+            --memory="${MEM_LIMIT}m" --memory-swap="${MEMSWAP_LIMIT}m" \
             -e EXPECTED_RELEASE="$EXPECTED_RELEASE" \
             -e LOCALVERSION_SUFFIX="$LOCALVERSION_SUFFIX" \
             -e PHONE_BASE_VERSION="$PHONE_BASE_VERSION" \
