@@ -17,8 +17,6 @@ on:
         options:
           - llvm-22.1.8
           - android-r563880c
-          - alchemist-clang22-lto-20261030
-          - alchemist-clang23-lto-20261030
       susfs:
         description: "Build SUSFS (simonpunk/susfs4ksu) into the kernel? on = patch it in, off = no SUSFS in the Image"
         type: choice
@@ -75,11 +73,6 @@ env:
   # Android clang to use. Change these two lines to try another toolchain.
   CLANG_DIR: clang-r563880c
   CLANG_MAJOR: "21"
-  # Alchemist LLVM (nekoshirro/Alchemist-LLVM), used when clang_choice = alchemist-clang22-lto-20261030 or alchemist-clang23-lto-20261030.
-  # The release ships clang 22 and clang 23; the clang_choice option (alchemist-clang22-... / alchemist-clang23-...)
-  # picks which one is used.
-  ALCHEMIST_REPO: nekoshirro/Alchemist-LLVM
-  ALCHEMIST_TAG: lto-20261030
   # Release string check. "" = auto: the base version is read from the kernel source Makefile
   # (VERSION.PATCHLEVEL.SUBLEVEL) and LOCALVERSION_SUFFIX is added. Put a full string here to force one.
   EXPECTED_RELEASE: ""
@@ -89,9 +82,6 @@ env:
   # a WARNING (vendor modules in the ROM may refuse to load a different release). Does not fail the build.
   PHONE_BASE_VERSION: "5.10.269"
   BUILD_IMAGE: debian:bookworm-slim
-  # Alchemist LLVM is built against a newer glibc (needs GLIBC_2.38, Debian bookworm only has 2.36),
-  # so the Alchemist choices build inside Ubuntu 24.04 (glibc 2.39) instead.
-  BUILD_IMAGE_ALCHEMIST: ubuntu:24.04
   # Version that apps see in `uname -r`, /proc/version and /proc/sys/kernel/osrelease.
   # DISPLAY ONLY: the kernel itself stays 5.10.269. kernel.release, LINUX_VERSION_CODE and the
   # module vermagic are NOT changed, so the vendor modules and FinaSU build and load as before.
@@ -373,56 +363,6 @@ jobs:
           bash fetch-clang.sh https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 "$CLANG_DIR" "$HOME/clang"
           "$HOME/clang/bin/clang" --version
           "$HOME/clang/bin/clang" --version | grep -q "clang version $CLANG_MAJOR\." || { echo "Expected clang $CLANG_MAJOR but got something else. Check CLANG_DIR."; exit 1; }
-          du -sh "$HOME/clang"
-
-      - name: Download Alchemist LLVM (nekoshirro/Alchemist-LLVM, release lto-20261030)
-        if: ${{ inputs.clang_choice == 'alchemist-clang22-lto-20261030' || inputs.clang_choice == 'alchemist-clang23-lto-20261030' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CLANG_CHOICE: ${{ inputs.clang_choice }}
-        run: |
-          set -eux
-          case "$CLANG_CHOICE" in
-            alchemist-clang23-*) ALCHEMIST_MAJOR=23 ;;
-            *)                   ALCHEMIST_MAJOR=22 ;;
-          esac
-          echo "wanted clang major: $ALCHEMIST_MAJOR"
-          # Download every asset of the release, unpack each one into its own folder and keep the
-          # toolchain whose `clang --version` major matches ALCHEMIST_MAJOR. This does not depend on
-          # the exact asset file names (and skips assets that are not runnable on the x86_64 runner).
-          rm -rf dl alch
-          mkdir -p dl alch "$HOME/clang"
-          gh release download "$ALCHEMIST_TAG" --repo "$ALCHEMIST_REPO" --dir dl --clobber
-          ls -la dl
-          found=0
-          i=0
-          for f in dl/*; do
-            i=$((i+1)); d="alch/$i"; mkdir -p "$d"
-            case "$f" in
-              *.tar.gz|*.tgz) tar -xzf "$f" -C "$d" || continue ;;
-              *.tar.xz)       tar -xJf "$f" -C "$d" || continue ;;
-              *.tar.zst)      tar --zstd -xf "$f" -C "$d" || continue ;;
-              *.zip)          unzip -q "$f" -d "$d" || continue ;;
-              *) echo "skip $f"; continue ;;
-            esac
-            C="$(find "$d" -maxdepth 4 -path '*/bin/clang' \( -type f -o -type l \) | head -n1)"
-            [ -n "$C" ] || { echo "no bin/clang in $f"; continue; }
-            V="$("$C" --version 2>/dev/null | sed -n '1s/.*clang version \([0-9][0-9]*\)\..*/\1/p')" || V=""
-            echo "$f -> clang major '${V:-unrunnable}'"
-            if [ "$V" = "$ALCHEMIST_MAJOR" ]; then
-              ROOT="$(dirname "$(dirname "$C")")"
-              rm -rf "$HOME/clang"
-              mv "$ROOT" "$HOME/clang"
-              found=1
-              break
-            fi
-          done
-          [ "$found" = 1 ] || { echo "ERROR: no clang $ALCHEMIST_MAJOR toolchain found in $ALCHEMIST_REPO $ALCHEMIST_TAG"; exit 1; }
-          rm -rf dl alch
-          "$HOME/clang/bin/clang" --version
-          for t in ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
-            test -x "$HOME/clang/bin/$t" || { echo "MISSING $t"; exit 1; }
-          done
           du -sh "$HOME/clang"
 
       - name: Download upstream LLVM 22.1.8
@@ -957,7 +897,6 @@ jobs:
         run: |
           set -eux
           IMG="$BUILD_IMAGE"
-          case "$CLANG_CHOICE" in alchemist-*) IMG="$BUILD_IMAGE_ALCHEMIST" ;; esac
           echo "build image: $IMG"
           # Cap the container just below RAM + swap. When the full-LTO link runs out of memory, the
           # container is squeezed/killed instead of starving the runner agent itself (that was the
@@ -1147,7 +1086,7 @@ jobs:
             echo "| fgetpriority | ${FGP_TXT} |"
             echo "| Seccomp | ${SECCOMP} |"
             echo "| uname | ${UNAME_TXT} |"
-            echo "| Build env | ${BUILD_IMAGE} (Alchemist choices: ${BUILD_IMAGE_ALCHEMIST}) |"
+            echo "| Build env | ${BUILD_IMAGE} |"
             echo "| Built by | ${GITHUB_ACTOR} as PsychoAvy@github · ${BUILD_DATE} |"
             echo "| Workflow run | [#${RUN_NO}](${RUN_URL}) |"
             echo
