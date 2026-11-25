@@ -413,6 +413,7 @@ jobs:
               echo "WARNING: fgetpriority ref '${FGETPRIORITY_SHA:-$FGETPRIORITY_BRANCH}' not found, using default branch"
               rm -rf fgetpriority
               fetch_sha "$FGETPRIORITY_REPO" HEAD fgetpriority || echo "WARNING: could not fetch fgetpriority"
+              echo "FGP_REF_USED=default branch" >> "$GITHUB_ENV"
             fi
             git -C fgetpriority log -1 --format='fgetpriority %H %s' || true
             find fgetpriority -maxdepth 2 -not -path '*/.git*' | head -40 || true
@@ -990,132 +991,61 @@ jobs:
           set -eu
           TAG="build-${{ github.run_number }}"
           RUN_NO="${{ github.run_number }}"
-          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           CFG=kernel/out/.config
           ZIP="$ZIP_NAME"
 
-          # ---------- collect every detail of this build ----------
           REL="$(cat kernel/out/include/config/kernel.release)"
           KVER="$(head -n 10 kernel/Makefile | awk '/^VERSION *=/{v=$3} /^PATCHLEVEL *=/{p=$3} /^SUBLEVEL *=/{s=$3} END{print v"."p"."s}')"
-
-          KSHA="$(git -C kernel rev-parse HEAD 2>/dev/null || echo unknown)"
-          KSHORT="$(echo "$KSHA" | cut -c1-7)"
-          KSUBJ="$(git -C kernel log -1 --format=%s 2>/dev/null || true)"
-
-          RSHA="$(git -C "kernel/$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
-          RSHORT="$(echo "$RSHA" | cut -c1-7)"
+          if [ "${SUSFS_ON:-0}" = 1 ]; then SUSFS_TITLE=" + SUSFS"; else SUSFS_TITLE=""; fi
+          short_sha() { git -C "$1" rev-parse HEAD 2>/dev/null | cut -c1-7 || echo unknown; }
+          # Root: git describe + the version number Kbuild printed into build.log (the one the manager shows)
           RDESC="$(git -C "kernel/$ROOT_DIR" describe --tags --always 2>/dev/null || echo unknown)"
-          RCOUNT="$(git -C "kernel/$ROOT_DIR" rev-list --count HEAD 2>/dev/null || echo '?')"
-          ROOT_URL="${ROOT_REPO%.git}"
-
-          NSHA="$(git -C nomount rev-parse HEAD 2>/dev/null || echo unknown)"
-          NSHORT="$(echo "$NSHA" | cut -c1-7)"
-
-          CLANG_VER="$("$HOME/clang/bin/clang" --version 2>/dev/null | head -n1 || true)"
-          [ -n "$CLANG_VER" ] || CLANG_VER="$CLANG_CHOICE"
-
-          if   grep -q '^CONFIG_LTO_CLANG_FULL=y' "$CFG"; then LTO="Full LTO"
-          elif grep -q '^CONFIG_LTO_CLANG_THIN=y' "$CFG"; then LTO="ThinLTO"
-          else LTO="LTO off"; fi
-          if grep -q '^CONFIG_CFI_CLANG=y' "$CFG"; then CFI="CFI on"; else CFI="CFI off"; fi
-
-          KSU_OPTS="$(grep -E '^CONFIG_KSU[A-Z0-9_]*=y' "$CFG" | grep -v 'CONFIG_KSU_SUSFS' | sed 's/^CONFIG_//; s/=y$//' | paste -sd, - | sed 's/,/, /g')"
-          yn() { if grep -q "^$1=y" "$CFG"; then echo "on"; else echo "off"; fi; }
-
-          if [ "$DISABLE_SECCOMP" = 1 ]; then SECCOMP="disabled (WARNING: may bootloop)"; else SECCOMP="stock (enabled)"; fi
-          if [ -n "$UNAME_FAKE_VERSION" ]; then UNAME_TXT="shows \`$UNAME_FAKE_VERSION\` to normal apps (real: \`$REL\`)"; else UNAME_TXT="real version (spoof off)"; fi
-          SUSFS_BULLET=""
-          SUSFS_OPTS=""
-          if [ "${SUSFS_ON:-0}" = 1 ]; then
-            SF_VER="$(sed -n 's/^#define SUSFS_VERSION[[:space:]]*"\(.*\)"/\1/p' kernel/include/linux/susfs.h | head -n1)"
-            SF_SHA="$(git -C susfs rev-parse HEAD 2>/dev/null || echo unknown)"
-            SF_SHORT="$(echo "$SF_SHA" | cut -c1-7)"
-            SF_URL="${SUSFS_REPO%.git}"
-            SUSFS_OPTS="$(grep -E '^CONFIG_KSU_SUSFS[A-Z0-9_]*=y' "$CFG" | sed 's/^CONFIG_//; s/=y$//' | paste -sd, - | sed 's/,/, /g')"
-            SUSFS_TXT="built in · \`${SF_VER:-?}\` · branch \`${SUSFS_BRANCH}\` · [\`${SF_SHORT}\`](${SF_URL}/-/commit/${SF_SHA})"
-            SUSFS_BULLET="- **SUSFS:** built in · \`${SF_VER:-?}\` · [\`${SF_SHORT}\`](${SF_URL}/-/commit/${SF_SHA}) · branch \`${SUSFS_BRANCH}\` (install a SUSFS userspace module after flashing)"
-          elif [ "$ENABLE_SUSFS_LKM" = 1 ]; then
-            SUSFS_TXT="off in the Image · LKM support on (\`__stack_chk_guard\` exported). Load your own susfs_guard_lkm module"
+          RNUM="$(sed -nE 's/^-- KernelSU(-Next)? version: ([0-9]+).*/\2/p' build.log 2>/dev/null | head -n1 || true)"
+          ROOT_TXT="${ROOT_NAME} ${RDESC}${RNUM:+ ($RNUM)}"
+          # Clang: Android builds say "... based on rNNN) clang version X"; upstream LLVM only "clang version X"
+          CLANG_LINE="$("$HOME/clang/bin/clang" --version 2>/dev/null | head -n1 || true)"
+          CVER="$(echo "$CLANG_LINE" | sed -nE 's/.*clang version ([0-9.]+).*/\1/p')"
+          COPT=""
+          if [ "$CLANG_CHOICE" = android-r563880c ]; then
+            CREV="$(echo "$CLANG_LINE" | sed -nE 's/.*based on (r[0-9a-z]+).*/\1/p')"
+            CLANG_TXT="Android clang ${CVER} (${CREV:-${CLANG_DIR#clang-}})"
+            COPT="$(echo "$CLANG_LINE" | sed 's/ clang version.*//' | grep -oE '\+[a-z0-9_]+' | paste -sd, - | sed 's/,/, /g' || true)"
           else
-            SUSFS_TXT="off"
+            CLANG_TXT="LLVM clang ${CVER:-${CLANG_CHOICE#llvm-}}"
           fi
-
-          if [ -f fgetpriority.ko ]; then
-            FGSHA="$(git -C fgetpriority rev-parse --short HEAD 2>/dev/null || echo '?')"
-            FGVM="$(strings -n 8 fgetpriority.ko | grep -m1 '^vermagic=' | cut -d= -f2- || true)"
-            FGP_TXT="built · \`$FGSHA\` · vermagic \`${FGVM:-?}\` (install after boot, not inside the Image)"
-          else
-            FGP_TXT="not built"
-          fi
-
-          if [ -s finasu-manager.hash ]; then
-            CERT_TXT="pinned, manager cert SHA-256 \`$(cat finasu-manager.hash)\` (use the FinaSU manager of tag \`$ROOT_REF\`)"
-          else
-            CERT_TXT="default manager certificate (install the normal KernelSU-Next manager, try the non-spoofed APK first)"
-          fi
-
-          sz() { numfmt --to=iec --suffix=B "$(stat -c%s "$1")"; }
-          BUILD_DATE="$(date -u '+%Y-%m-%d %H:%M UTC')"
-
-          # ---------- write the release notes ----------
+          # TCP: only what is really enabled in the final .config, the default one listed last
+          TCP_DEF="$(sed -nE 's/^CONFIG_DEFAULT_TCP_CONG="(.*)"/\1/p' "$CFG")"
+          TCP_LIST=""; TCP_LAST=""
+          for pair in BBR:bbr Westwood:westwood Cubic:cubic; do
+            name="${pair%:*}"; id="${pair#*:}"
+            grep -q "^CONFIG_TCP_CONG_$(echo "$id" | tr a-z A-Z)=y" "$CFG" || continue
+            if [ "$id" = "$TCP_DEF" ]; then TCP_LAST="$name (default)"; else TCP_LIST="${TCP_LIST:+$TCP_LIST, }$name"; fi
+          done
+          if [ -n "$TCP_LAST" ]; then TCP_LIST="${TCP_LIST:+$TCP_LIST, }$TCP_LAST"; fi
           {
-            if [ "${SUSFS_ON:-0}" = 1 ]; then SUSFS_TITLE=" + SUSFS"; else SUSFS_TITLE=""; fi
-            echo "# marble ${KVER} · NoMount + ${ROOT_NAME}${SUSFS_TITLE} · run ${RUN_NO}"
+            echo "## Marble-Kernel-X"
             echo
             echo "\`${REL}\`"
             echo
-            echo "- **Root:** ${ROOT_NAME} \`${RDESC}\` ([\`${RSHORT}\`](${ROOT_URL}/commit/${RSHA}), ${RCOUNT} commits) · [repo](${ROOT_URL}) · ref \`${ROOT_REF}\`"
-            [ -z "$SUSFS_BULLET" ] || echo "$SUSFS_BULLET"
-            echo "- **NoMount:** built in (install the NoMount module after flashing) · ref \`${NOMOUNT_BRANCH}\` · [\`${NSHORT}\`](${NOMOUNT_REPO}/commit/${NSHA})"
-            echo "- **Clang:** \`${CLANG_VER}\` · ${LTO} · ${CFI} · choice \`${CLANG_CHOICE}\`"
-            echo "- **Commit:** [\`${KSHORT}\`](${KERNEL_REPO}/commit/${KSHA}) · ${KSUBJ}"
-            echo "- **Base:** [psychoela/marble-kernel-x](${KERNEL_REPO}) (Evolution-X sm8450 fork), branch \`${KERNEL_BRANCH}\` · [source](${KERNEL_REPO}/tree/${KSHA})"
-            echo
-            echo "> Flash in recovery (or with a kernel flasher). Back up boot first."
-            echo
-            echo "## Details"
-            echo
-            echo "| | |"
-            echo "|---|---|"
-            echo "| Device | POCO F5 / Redmi Note 12 Turbo (marble, marblein) |"
-            echo "| Kernel base | ${KVER} (phone runs ${PHONE_BASE_VERSION}) |"
-            echo "| Root options | ${KSU_OPTS:-none} |"
-            echo "| Manager | ${CERT_TXT} |"
-            echo "| SUSFS | ${SUSFS_TXT} |"
-            [ -z "$SUSFS_OPTS" ] || echo "| SUSFS features | ${SUSFS_OPTS} |"
-            echo "| fgetpriority | ${FGP_TXT} |"
-            echo "| Seccomp | ${SECCOMP} |"
-            echo "| uname | ${UNAME_TXT} |"
-            echo "| Build env | ${BUILD_IMAGE} |"
-            echo "| Built by | ${GITHUB_ACTOR} as PsychoAvy@github · ${BUILD_DATE} |"
-            echo "| Workflow run | [#${RUN_NO}](${RUN_URL}) |"
-            echo
-            echo "## Extras in this build"
-            echo
-            echo "- TCP BBR: $(yn CONFIG_TCP_CONG_BBR) · Westwood: $(yn CONFIG_TCP_CONG_WESTWOOD) · fq: $(yn CONFIG_NET_SCH_FQ)"
-            echo "- fq_codel: $(yn CONFIG_NET_SCH_FQ_CODEL) · cake: $(yn CONFIG_NET_SCH_CAKE)"
-            echo "- TTL/HL iptables target (hotspot TTL): $(yn CONFIG_NETFILTER_XT_TARGET_HL) · WireGuard: $(yn CONFIG_WIREGUARD)"
-            echo "- NoMount: $(yn CONFIG_NOMOUNT) · ${ROOT_NAME}: $(yn CONFIG_KSU) · SUSFS: $(yn CONFIG_KSU_SUSFS)"
-            echo
-            if [ "${SUSFS_ON:-0}" = 1 ]; then
-              echo "## SUSFS notes"
-              echo
-              echo "- This only adds the kernel side. Hiding does nothing until a SUSFS userspace module (for example [sidex15/susfs4ksu-module](https://github.com/sidex15/susfs4ksu-module)) is installed and configured."
-              echo "- Do not load the separate susfs_guard_lkm module on this build, SUSFS is already inside the Image."
-              echo "- \`uname\` spoofing is done by SUSFS (spoof_uname) now; the workflow's own uname spoof is switched off."
-              echo "- If the phone bootloops, flash your previous boot/Image, or rebuild with the \`susfs\` input set to **off**."
-              echo
+            echo "- **Root:** ${ROOT_TXT}"
+            # release tag; on master there is no tag, so use the base version from the source
+            NVER="$NOMOUNT_BRANCH"
+            if [ "$NVER" = master ] || [ -n "$NOMOUNT_SHA" ]; then
+              NVER="$(sed -nE 's/^#define NOMOUNT_BASE_VERSION "(.*)"/\1/p' nomount/kernel/src/nomount.h | head -n1)"
             fi
-            echo "## Files"
-            echo
-            echo "- \`${ZIP}\` (${ZIP_SZ:-$(sz "$ZIP")}): AnyKernel3 zip, flash this"
-            echo "- \`Image\` ($(sz Image)): raw kernel Image"
-            if [ -f fgetpriority.ko ]; then echo "- \`fgetpriority.ko\` ($(sz fgetpriority.ko)): optional LKM"; fi
-            echo "- \`SHA256SUMS\`"
-            echo
-            echo '```'
-            cat SHA256SUMS
-            echo '```'
+            echo "- **NoMount:** ${NVER:+$NVER }built in ($(short_sha nomount))"
+            # fgetpriority is a separate module in this build: only listed when it was really built
+            if [ -f fgetpriority.ko ]; then
+              echo "- **fgetpriority:** fgetpriority.ko (${FGP_REF_USED:-$FGETPRIORITY_BRANCH}, $(short_sha fgetpriority))"
+            fi
+            if [ "${SUSFS_ON:-0}" = 1 ]; then
+              SVER="$(sed -nE 's/^#define SUSFS_VERSION[[:space:]]+"(.*)"/\1/p' kernel/include/linux/susfs.h | head -n1)"
+              echo "- **SUSFS:** ${SVER:+$SVER, }built in (${SUSFS_BRANCH}, $(short_sha susfs)). Do not load the SUSFS LKM"
+            fi
+            echo "- **Clang:** ${CLANG_TXT}"
+            if [ -n "$COPT" ]; then echo "  - Optimizations: ${COPT}"; fi
+            echo "- **TCP:** ${TCP_LIST}"
+            echo "- **Base:** marble-kernel-x (${KERNEL_BRANCH}), [source](${KERNEL_REPO})"
           } > release-notes.md
           cat release-notes.md
 
