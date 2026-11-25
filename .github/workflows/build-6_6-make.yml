@@ -866,7 +866,6 @@ jobs:
           cat release-notes.md
           gh release create "$TAG" "$ZIP" Image SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
             --title "marble ${KVER} ${ROOT_NAME}$( [ "$WITH_NOMOUNT" = true ] && echo ' + NoMount')$( [ "$WITH_FGP" = true ] && echo ' + fgetpriority')$( [ "$WITH_SUSFS" = true ] && echo ' + SUSFS')" \
             --notes-file release-notes.md \
             --prerelease

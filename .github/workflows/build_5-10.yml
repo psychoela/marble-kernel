@@ -99,14 +99,14 @@ env:
   # Set to "0" if you stop using the SUSFS LKM.
   # Automatically forced to "0" when the "susfs" input is on (built-in SUSFS replaces the LKM).
   ENABLE_SUSFS_LKM: "1"
-  # fgetpriority (aerath-stuff/fgetpriority, branch lkm, falls back to the default branch): small LKM that filters getpriority syscalls,
+  # fgetpriority (aerath-stuff/fgetpriority, branch master, falls back to the default branch): small LKM that filters getpriority syscalls,
   # a helper for HMA/HMAL/HMA-OSS. It is built as a .ko against THIS kernel (same config, clang and
   # vermagic) and shipped next to the zip as fgetpriority.ko. It is NOT built into the Image: install it
   # after boot with the repo's module/installer. A failure here only prints a WARNING, the kernel still ships.
   # FGETPRIORITY_SHA "" = tip of FGETPRIORITY_BRANCH (if that branch is missing, the default branch is used). Set ENABLE_FGETPRIORITY to "0" to skip it.
   ENABLE_FGETPRIORITY: "1"
   FGETPRIORITY_REPO: https://github.com/aerath-stuff/fgetpriority
-  FGETPRIORITY_BRANCH: lkm
+  FGETPRIORITY_BRANCH: master
   FGETPRIORITY_SHA: ""
 
 jobs:
@@ -1053,7 +1053,6 @@ jobs:
           if [ -f fgetpriority.ko ]; then FILES="$FILES fgetpriority.ko"; fi
           gh release create "$TAG" $FILES \
             --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
             --title "marble ${KVER} ${ROOT_NAME}${SUSFS_TITLE} · run ${RUN_NO}" \
             --notes-file release-notes.md \
             --prerelease
